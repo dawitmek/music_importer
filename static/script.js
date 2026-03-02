@@ -52,6 +52,7 @@
 let ws=null,wsStatus={},stagingTracks=[];
 let currentPath='',sortBy='date',sortDir=-1,autoScroll=true;
 let selectedFiles = new Set();
+let currentItems = []; // Store current view items for select all
 let isMultiSelectMode = false;
 let longPressTimer = null;
 let viewMode = 'auto'; // 'auto', 'grid', 'list'
@@ -476,8 +477,34 @@ async function loadFiles(path=currentPath){
     const r=await fetch(`/api/files?path=${enc(path)}`);
     const data=await r.json();
     if(data.disk)updateDashboardDisk(data.disk);
-    renderFiles(data.items||[]);
+    currentItems = data.items || [];
+    renderFiles(currentItems);
   }catch{toast('Failed to load files','error');}
+}
+
+function toggleSelectAll(){
+    const filter=document.getElementById('fm-search').value.toLowerCase();
+    const filtered = currentItems.filter(f => f.name.toLowerCase().includes(filter));
+    
+    // If everything filtered is already selected, clear them. Otherwise, select all filtered.
+    const allFilteredSelected = filtered.every(f => selectedFiles.has(f.path));
+    
+    if(allFilteredSelected){
+        filtered.forEach(f => selectedFiles.delete(f.path));
+    } else {
+        filtered.forEach(f => selectedFiles.add(f.path));
+    }
+    
+    isMultiSelectMode = selectedFiles.size > 0;
+    
+    // Update UI
+    document.querySelectorAll('.file-card').forEach(card => {
+        const path = card.getAttribute('data-path');
+        if(selectedFiles.has(path)) card.classList.add('selected');
+        else card.classList.remove('selected');
+    });
+    
+    updateBatchToolbar();
 }
 function updateDashboardDisk(disk){
   const pct=Math.round((disk.used/disk.total)*100);
@@ -578,6 +605,7 @@ function renderFiles(items){
     const meta = isDir ? 'folder' : fmtBytes(f.size);
 
     return `<div class="file-card ${layoutClass} ${isSelected ? 'selected' : ''}" style="animation-delay:${idx*.02}s" 
+                 data-path="${esc(f.path)}"
                  onmousedown="onFileMouseDown('${esc(f.path)}', event)"
                  onmouseup="onFileMouseUp('${esc(f.path)}', '${esc(f.type)}', event)"
                  onmouseleave="onFileMouseLeave()"
