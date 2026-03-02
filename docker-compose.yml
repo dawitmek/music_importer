@@ -1,0 +1,21 @@
+version: '3.9'
+
+services:
+  musicvault:
+    build: .
+    container_name: musicvault
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./downloads:/app/downloads
+      - ./data:/app/data
+      - ./config:/app/config
+    environment:
+      - DEEZER_ARL=${DEEZER_ARL:-}
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
