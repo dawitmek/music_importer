@@ -1,13 +1,13 @@
 services:
   musicvault:
-    build: .
+    build: /app/music_import
     container_name: musicvault
     ports:
-      - "8080:8080"
+      - "8081:8080"
     volumes:
-      - ./downloads:/app/downloads
-      - ./data:/app/data
-      - ./config:/app/config
+      - /app/music_import/downloads:/app/downloads
+      - /app/music_import/data:/app/data
+      - /app/music_import/config:/app/config
     environment:
       - PYTHONUNBUFFERED=1
     command: python server.py
