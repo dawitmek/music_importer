@@ -53,6 +53,7 @@ let ws=null,wsStatus={},stagingTracks=[];
 let currentPath='',sortBy='date',sortDir=-1,autoScroll=true;
 let selectedFiles = new Set();
 let currentItems = []; // Store current view items for select all
+let lastSuggestions = []; // Store search results to avoid JSON attribute escaping issues
 let isMultiSelectMode = false;
 let longPressTimer = null;
 let viewMode = 'auto'; // 'auto', 'grid', 'list'
@@ -430,24 +431,30 @@ async function processCoverQueue() {
 }
 
 function renderSug(tracks){
+  lastSuggestions = tracks; // Store for index-based retrieval
   if(!tracks.length){
     sugEl.innerHTML=`<div style="padding:20px;color:var(--dim);text-align:center;font-size:12px;font-family:'JetBrains Mono',monospace">No results found</div>`;
     sugEl.classList.remove('hidden');return;
   }
-  sugEl.innerHTML=tracks.map(t=>{
-    const trackData = JSON.stringify(t);
+  sugEl.innerHTML=tracks.map((t, idx)=>{
     return `
-    <div class="suggestion-item" onclick='addToStaging(${trackData})'>
+    <div class="suggestion-item" onclick='addToStagingIdx(${idx})'>
       <img class="sug-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
       <div class="sug-info">
         <div class="sug-title">${esc(t.title)}</div>
         <div class="sug-meta">${esc(t.artist)} · ${esc(t.album)}</div>
       </div>
       <span class="sug-dur">${fmtDur(t.duration)}</span>
-      <button class="sug-add-btn" onclick='event.stopPropagation(); addToStaging(${trackData})'>+ Stage</button>
+      <button class="sug-add-btn" onclick='event.stopPropagation(); addToStagingIdx(${idx})'>+ Stage</button>
     </div>`;
   }).join('');
   sugEl.classList.remove('hidden');
+}
+
+function addToStagingIdx(idx) {
+    if (lastSuggestions[idx]) {
+        addToStaging(lastSuggestions[idx]);
+    }
 }
 
 // ── Mode toggle ──────────────────────────
