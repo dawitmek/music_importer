@@ -60,32 +60,48 @@
         </div>
         <div class="dashboard">
           <div class="dash-card">
-            <div class="dash-label">Vault Storage</div>
+            <div class="dash-label">Library Size</div>
             <div class="dash-main">
-              <div class="dash-val" id="dash-storage-pct">0%</div>
-              <div class="dash-bar"><div class="dash-fill" id="dash-storage-fill"></div></div>
+              <div class="dash-val" id="dash-storage-val" style="font-size:24px; color:var(--cyan)">0 B</div>
             </div>
-            <div class="dash-sub" id="dash-storage-text">calculating...</div>
+            <div class="dash-sub" id="dash-storage-text">Disk storage</div>
           </div>
           <div class="dash-card">
-            <div class="dash-label">Session Activity</div>
-            <div class="dash-main session-stats">
-              <div class="sess-item"><div class="sess-val" id="dash-done">0</div><div class="sess-lab">DONE</div></div>
-              <div class="sess-item"><div class="sess-val" id="dash-fail" style="color:var(--rose)">0</div><div class="sess-lab">FAIL</div></div>
-              <div class="sess-item"><div class="sess-val" id="dash-queue">0</div><div class="sess-lab">WAIT</div></div>
-            </div>
-            <div class="dash-sub">Since server start</div>
-          </div>
-          <div class="dash-card">
-            <div class="dash-label">System Status</div>
-            <div style="display:flex; align-items:center; gap:12px; flex:1; min-width:0;">
-              <img id="dash-status-cover" src="/api/track-cover" alt="Status" style="width:48px; height:48px; border-radius:6px; object-fit:cover; border:1px solid var(--border); display:none; flex-shrink:0;"/>
-              <div id="dash-status-main" style="flex:1; display:flex; flex-direction:column; justify-content:center; min-width:0;">
-                <div id="dash-status-title" style="font-family:'Barlow Condensed', sans-serif; font-size:20px; font-weight:700; color:var(--muted); letter-spacing:1px; text-transform:uppercase;">IDLE</div>
-                <div id="dash-status-detail" style="font-size:12px; color:var(--text); margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Waiting for tracks...</div>
+            <div class="dash-label">Batch Progress</div>
+            <div class="dash-main batch-stats">
+              <div class="batch-progress">
+                <div class="batch-val" id="dash-batch-pct" style="font-size:24px;">0%</div>
+                <div class="dash-bar"><div class="dash-fill" id="dash-batch-fill"></div></div>
+                <div class="batch-label" id="dash-batch-text">Batch: 0 / 0</div>
               </div>
             </div>
-            <div class="dash-sub" id="dash-status-sub">Ready for input</div>
+          </div>
+          <div class="dash-card">
+            <div class="dash-label">Session Summary</div>
+            <div class="session-summary">
+              <div class="sess-item" style="text-align:left;"><div class="sess-val" id="dash-done" style="font-size:20px;">0</div><div class="sess-lab">COMPLETED</div></div>
+              <div class="sess-item" style="text-align:left;"><div class="sess-val" id="dash-fail" style="color:var(--rose); font-size:20px;">0</div><div class="sess-lab">FAILED</div></div>
+            </div>
+          </div>
+          <div class="dash-card">
+            <div class="dash-label">Last Complete</div>
+            <div class="dash-main">
+              <div class="dash-val" id="dash-last-complete" style="font-size:18px; color:var(--emerald)">Never</div>
+            </div>
+            <div class="dash-sub">Finished at</div>
+          </div>
+        </div>
+        <div class="dashboard" style="grid-template-columns: 1fr; margin-top: -10px;">
+          <div class="dash-card" style="min-height: 80px;">
+            <div class="dash-label">System Status</div>
+            <div style="display:flex; align-items:center; gap:16px; flex:1; min-width:0;">
+              <img id="dash-status-cover" src="/api/track-cover" alt="Status" style="width:52px; height:52px; border-radius:6px; object-fit:cover; border:1px solid var(--border); display:none; flex-shrink:0;"/>
+              <div id="dash-status-main" style="flex:1; display:flex; flex-direction:column; justify-content:center; min-width:0;">
+                <div id="dash-status-title" style="font-family:'Barlow Condensed', sans-serif; font-size:22px; font-weight:700; color:var(--muted); letter-spacing:1px; text-transform:uppercase;">IDLE</div>
+                <div id="dash-status-detail" style="font-size:14px; color:var(--text); margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Waiting for tracks...</div>
+              </div>
+              <div id="dash-status-sub" style="font-size:13px; font-weight:700; color:var(--cyan); background:var(--cyan-dim); padding:4px 10px; border-radius:4px; border:1px solid var(--cyan-glow);">Ready</div>
+            </div>
           </div>
         </div>
         <div class="card search-card">
@@ -154,7 +170,10 @@
         <div class="disk-meter">
           <span style="font-size:18px">💿</span>
           <div class="disk-bar"><div class="disk-fill" id="disk-fill" style="width:0%;background:linear-gradient(90deg,var(--cyan),var(--gold))"></div></div>
-          <div class="disk-info" id="disk-info">—</div>
+          <div class="disk-info" id="disk-info" style="display:flex; flex-direction:column; gap:2px;">
+            <div id="disk-used" style="color:var(--cyan); font-weight:600;">—</div>
+            <div id="disk-pct" style="font-size:10px; font-weight:700; letter-spacing:0.5px;">0% USED</div>
+          </div>
         </div>
         <div class="fm-header">
           <div class="breadcrumb" id="breadcrumb"><span class="bread-part active" onclick="loadFiles('')">⌂ Root</span></div>

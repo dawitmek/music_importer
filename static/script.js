@@ -56,6 +56,8 @@ let currentItems = []; // Store current view items for select all
 let isMultiSelectMode = false;
 let longPressTimer = null;
 let viewMode = 'auto'; // 'auto', 'grid', 'list'
+let coverQueue = [];
+let processingCover = false;
 
 // ── WebSocket ────────────────────────────
 function connectWS(){
@@ -78,12 +80,35 @@ function connectWS(){
 
 function updateUI(s){
   const q=s.queue||[],a=s.active||[],c=s.completed||[],f=s.failed||[];
-  
-  // Update Dashboard Session Stats
-  document.getElementById('dash-done').textContent = c.length;
-  document.getElementById('dash-fail').textContent = f.length;
-  document.getElementById('dash-queue').textContent = q.length;
-  
+  const batchTotal = s.batch_total || 0;
+  const batchDone = s.batch_completed || 0;
+
+  // Update Dashboard Session Stats & Batch Progress
+  const batchPct = batchTotal > 0 ? Math.round((batchDone / batchTotal) * 100) : 0;
+  const dashBatchPct = document.getElementById('dash-batch-pct');
+  const dashBatchFill = document.getElementById('dash-batch-fill');
+  const dashBatchText = document.getElementById('dash-batch-text');
+
+  if(dashBatchPct) dashBatchPct.textContent = `${batchPct}%`;
+  if(dashBatchFill) dashBatchFill.style.width = `${batchPct}%`;
+  if(dashBatchText) dashBatchText.textContent = `Batch: ${batchDone} / ${batchTotal}`;
+
+  if(document.getElementById('dash-done')) document.getElementById('dash-done').textContent = c.length;
+  if(document.getElementById('dash-fail')) document.getElementById('dash-fail').textContent = f.length;
+
+    const lastCompleteEl = document.getElementById('dash-last-complete');
+    if(lastCompleteEl && s.last_batch_finished_at) {
+        const date = new Date(s.last_batch_finished_at * 1000);
+        // toLocaleString automatically uses the browser's local timezone
+        lastCompleteEl.textContent = date.toLocaleString([], {
+            month: 'short', 
+            day: 'numeric',
+            hour: '2-digit', 
+            minute: '2-digit'
+        });
+        lastCompleteEl.style.fontSize = '14px';
+    }
+
   // Update Dashboard System Status
   const statusTitle = document.getElementById('dash-status-title');
   const statusDetail = document.getElementById('dash-status-detail');
@@ -95,7 +120,9 @@ function updateUI(s){
       statusTitle.textContent = 'DOWNLOADING';
       statusTitle.style.color = 'var(--gold)';
       statusDetail.textContent = `${current.artist} - ${current.title}`;
-      statusSub.textContent = q.length > 0 ? `${q.length} more in queue` : 'Processing last item';
+      statusSub.textContent = q.length > 0 ? `${q.length} IN QUEUE` : 'FINALIZING';
+      statusSub.style.color = 'var(--cyan)';
+      statusSub.style.background = 'var(--cyan-dim)';
       if(statusCover) {
           statusCover.src = current.cover || `/api/track-cover?artist=${enc(current.artist)}&title=${enc(current.title)}`;
           statusCover.style.display = 'block';
@@ -105,7 +132,9 @@ function updateUI(s){
       statusTitle.textContent = 'QUEUED';
       statusTitle.style.color = 'var(--cyan)';
       statusDetail.textContent = `${first.artist} - ${first.title}`;
-      statusSub.textContent = `${q.length} tracks waiting`;
+      statusSub.textContent = `${q.length} PENDING`;
+      statusSub.style.color = 'var(--cyan)';
+      statusSub.style.background = 'var(--cyan-dim)';
       if(statusCover) {
           statusCover.src = first.cover || `/api/track-cover?artist=${enc(first.artist)}&title=${enc(first.title)}`;
           statusCover.style.display = 'block';
@@ -113,8 +142,10 @@ function updateUI(s){
   } else {
       statusTitle.textContent = 'IDLE';
       statusTitle.style.color = 'var(--muted)';
-      statusDetail.textContent = 'Standing by for input';
-      statusSub.textContent = 'System ready';
+      statusDetail.textContent = 'Ready for new tracks';
+      statusSub.textContent = 'READY';
+      statusSub.style.color = 'var(--muted)';
+      statusSub.style.background = 'transparent';
       if(statusCover) statusCover.style.display = 'none';
   }
 
@@ -327,8 +358,15 @@ async function doPlaylistSearch(url){
             tracks.forEach(t=>{
                 if(!stagingTracks.find(st=>st.title===t.title&&st.artist===t.artist)){
                     t.playlist_name = playlistTitle;
+                    // Ensure unique ID for background update tracking
+                    t.tempId = Math.random().toString(36).substring(7);
                     stagingTracks.push(t);
                     added++;
+                    
+                    // Fetch cover in background if missing
+                    if(!t.cover || t.cover === '') {
+                        fetchCoverInBackground(t);
+                    }
                 }
             });
             renderStaging();
@@ -342,6 +380,40 @@ async function doPlaylistSearch(url){
     }
 }
 
+function fetchCoverInBackground(track) {
+    coverQueue.push(track);
+    if (!processingCover) {
+        processCoverQueue();
+    }
+}
+
+async function processCoverQueue() {
+    if (coverQueue.length === 0) {
+        processingCover = false;
+        return;
+    }
+
+    processingCover = true;
+    const track = coverQueue.shift();
+
+    try {
+        const r = await fetch(`/api/track-cover?artist=${enc(track.artist)}&title=${enc(track.title)}`);
+        if (r.ok) {
+            const staged = stagingTracks.find(st => st.tempId === track.tempId);
+            if (staged) {
+                const blob = await r.blob();
+                staged.cover = URL.createObjectURL(blob);
+                renderStaging();
+            }
+        }
+    } catch (e) {
+        console.warn("Failed to fetch cover in background", e);
+    }
+
+    // Small delay between requests to be gentle
+    setTimeout(processCoverQueue, 100);
+}
+
 function renderSug(tracks){
   if(!tracks.length){
     sugEl.innerHTML=`<div style="padding:20px;color:var(--dim);text-align:center;font-size:12px;font-family:'JetBrains Mono',monospace">No results found</div>`;
@@ -351,7 +423,7 @@ function renderSug(tracks){
     const trackData = JSON.stringify(t);
     return `
     <div class="suggestion-item" onclick='addToStaging(${trackData})'>
-      <img class="sug-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover'" loading="lazy"/>
+      <img class="sug-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
       <div class="sug-info">
         <div class="sug-title">${esc(t.title)}</div>
         <div class="sug-meta">${esc(t.artist)} · ${esc(t.album)}</div>
@@ -424,7 +496,7 @@ function renderStaging(){
   if(!stagingTracks.length){el.innerHTML=`<div class="staging-empty">No tracks staged — search and add songs above</div>`;return;}
   el.innerHTML=stagingTracks.map((t,i)=>`
     <div class="staging-item">
-      <img class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover'" loading="lazy"/>
+      <img class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
       <div style="flex:1;min-width:0"><div class="staging-title">${esc(t.title)}</div><div class="staging-artist">${esc(t.artist||'—')}</div></div>
       <button class="staging-remove" onclick="removeStaging(${i})">✕</button>
     </div>`).join('');
@@ -476,7 +548,7 @@ async function loadFiles(path=currentPath){
   try{
     const r=await fetch(`/api/files?path=${enc(path)}`);
     const data=await r.json();
-    if(data.disk)updateDashboardDisk(data.disk);
+    updateDashboardDisk(data);
     currentItems = data.items || [];
     renderFiles(currentItems);
   }catch{toast('Failed to load files','error');}
@@ -506,26 +578,32 @@ function toggleSelectAll(){
     renderFiles(currentItems);
     updateBatchToolbar();
 }
-function updateDashboardDisk(disk){
-  const pct=Math.round((disk.used/disk.total)*100);
-  const fill = document.getElementById('dash-storage-fill');
-  const pctText = document.getElementById('dash-storage-pct');
-  const subText = document.getElementById('dash-storage-text');
+function updateDashboardDisk(data){
+  const disk = data.disk || {total:1, used:0, free:1};
+  const folderSize = data.folder_size || 0;
+  const pct = Math.round((disk.used / disk.total) * 100);
   
-  if(fill) fill.style.width=`${pct}%`;
-  if(pctText) pctText.textContent = `${pct}%`;
-  if(subText) subText.textContent = `${fmtBytes(disk.used)} / ${fmtBytes(disk.total)}`;
+  // Dashboard update: only folder size
+  const dashVal = document.getElementById('dash-storage-val');
+  if(dashVal) dashVal.textContent = fmtBytes(folderSize);
   
-  if(fill){
-      fill.style.background=pct>90?'var(--rose)':pct>70?'var(--amber)':'linear-gradient(90deg,var(--cyan),var(--gold))';
+  // Library page: full disk meter
+  const fill = document.getElementById('disk-fill');
+  const usedText = document.getElementById('disk-used');
+  const pctText = document.getElementById('disk-pct');
+  
+  if(fill) {
+      fill.style.width=`${pct}%`;
+      const color = pct > 90 ? 'var(--rose)' : pct > 70 ? 'var(--amber)' : 'var(--emerald)';
+      fill.style.background = pct > 70 ? color : 'linear-gradient(90deg,var(--cyan),var(--gold))';
+      if(pctText) {
+          pctText.textContent = `${pct}% USED`;
+          pctText.style.color = color;
+      }
   }
-  
-  // Also update the old library disk meter if it still exists
-  const oldFill = document.getElementById('disk-fill');
-  if(oldFill){
-      oldFill.style.width=`${pct}%`;
-      const dpInfo = document.getElementById('disk-info');
-      if(dpInfo) dpInfo.textContent=`${fmtBytes(disk.used)} / ${fmtBytes(disk.total)} (${pct}%)`;
+  if(usedText) {
+      usedText.textContent = `${fmtBytes(disk.used)} / ${fmtBytes(disk.total)}`;
+      usedText.style.color = 'var(--cyan)';
   }
 }
 

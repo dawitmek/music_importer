@@ -252,7 +252,11 @@ DOWNLOAD_STATUS: dict = {
     "completed": [],
     "failed": [],
     "logs": [],
+    "batch_total": 0,
+    "batch_completed": 0,
+    "last_batch_finished_at": None,
 }
+
 DEEZER_MAX_QUALITY = None  # Persistent memory for account capability (0, 1, 2, 3)
 DOWNLOAD_LOCK = asyncio.Lock()
 
@@ -569,6 +573,12 @@ async def process_download(item: dict):
     # Finalize
     async with DOWNLOAD_LOCK:
         DOWNLOAD_STATUS["active"] = [x for x in DOWNLOAD_STATUS["active"] if x["id"] != tid]
+        DOWNLOAD_STATUS["batch_completed"] += 1
+        
+        # If queue and active are now empty, the batch is done
+        if not DOWNLOAD_STATUS["queue"] and not DOWNLOAD_STATUS["active"]:
+            DOWNLOAD_STATUS["last_batch_finished_at"] = time.time()
+            
         item["status"] = "completed" if success else "failed"
         item["method"] = method
         item["finished_at"] = time.time()
@@ -750,6 +760,12 @@ async def download_single(request):
         "type": "single",
     }
     async with DOWNLOAD_LOCK:
+        if not DOWNLOAD_STATUS["queue"] and not DOWNLOAD_STATUS["active"]:
+            DOWNLOAD_STATUS["batch_total"] = 1
+            DOWNLOAD_STATUS["batch_completed"] = 0
+        else:
+            DOWNLOAD_STATUS["batch_total"] += 1
+            
         DOWNLOAD_STATUS["queue"].append(item)
         save_status()
     await broadcast()
@@ -761,6 +777,12 @@ async def download_playlist(request):
     tracks = body.get("tracks", [])
     ids = []
     async with DOWNLOAD_LOCK:
+        if not DOWNLOAD_STATUS["queue"] and not DOWNLOAD_STATUS["active"]:
+            DOWNLOAD_STATUS["batch_total"] = len(tracks)
+            DOWNLOAD_STATUS["batch_completed"] = 0
+        else:
+            DOWNLOAD_STATUS["batch_total"] += len(tracks)
+            
         for t in tracks:
             p_name = t.get("playlist_name")
             item = {
@@ -790,6 +812,8 @@ async def clear_queue(request):
     clear_all = body.get("all", False)
     async with DOWNLOAD_LOCK:
         DOWNLOAD_STATUS["queue"] = []
+        DOWNLOAD_STATUS["batch_total"] = 0
+        DOWNLOAD_STATUS["batch_completed"] = 0
         if clear_all:
             DOWNLOAD_STATUS["completed"] = []
             DOWNLOAD_STATUS["failed"] = []
@@ -831,6 +855,8 @@ async def stop_downloads(request):
     async with DOWNLOAD_LOCK:
         DOWNLOAD_STATUS["queue"] = []
         DOWNLOAD_STATUS["active"] = []
+        DOWNLOAD_STATUS["batch_total"] = 0
+        DOWNLOAD_STATUS["batch_completed"] = 0
         save_status()
     await broadcast()
     return web.json_response({"ok": True})
@@ -903,6 +929,10 @@ async def track_cover(request):
     return web.Response(text=svg, content_type="image/svg+xml")
 
 
+def get_folder_size(path: Path) -> int:
+    return sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+
+
 async def list_files(request):
     path_param = request.rel_url.query.get("path", "")
     base = DOWNLOADS_DIR
@@ -931,9 +961,12 @@ async def list_files(request):
 
     # Disk usage
     total, used, free = shutil.disk_usage(str(base))
+    folder_size = get_folder_size(base)
+    
     return web.json_response({
         "items": items,
         "path": path_param,
+        "folder_size": folder_size,
         "disk": {"total": total, "used": used, "free": free},
     })
 
