@@ -8,7 +8,6 @@ services:
       - ./downloads:/app/downloads
       - ./data:/app/data
       - ./config:/app/config
-      - ./.vaultkey:/app/.vaultkey
     environment:
       - PYTHONUNBUFFERED=1
     command: python server.py

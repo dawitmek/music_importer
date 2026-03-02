@@ -483,10 +483,15 @@ async function loadFiles(path=currentPath){
 }
 
 function toggleSelectAll(){
-    const filter=document.getElementById('fm-search').value.toLowerCase();
+    if (!currentItems || currentItems.length === 0) return;
+
+    const searchInput = document.getElementById('fm-search');
+    const filter = (searchInput ? searchInput.value : '').toLowerCase();
     const filtered = currentItems.filter(f => f.name.toLowerCase().includes(filter));
     
-    // If everything filtered is already selected, clear them. Otherwise, select all filtered.
+    if (filtered.length === 0) return;
+
+    // Check if all visible items are already selected
     const allFilteredSelected = filtered.every(f => selectedFiles.has(f.path));
     
     if(allFilteredSelected){
@@ -497,13 +502,8 @@ function toggleSelectAll(){
     
     isMultiSelectMode = selectedFiles.size > 0;
     
-    // Update UI
-    document.querySelectorAll('.file-card').forEach(card => {
-        const path = card.getAttribute('data-path');
-        if(selectedFiles.has(path)) card.classList.add('selected');
-        else card.classList.remove('selected');
-    });
-    
+    // Re-render to ensure UI is perfectly in sync
+    renderFiles(currentItems);
     updateBatchToolbar();
 }
 function updateDashboardDisk(disk){

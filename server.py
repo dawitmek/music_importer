@@ -41,7 +41,7 @@ SONGS_FILE = DATA_DIR / "extracted_songs.json"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 # index.html may sit at root (flat) or inside frontend/ (nested)
 FRONTEND_DIR = BASE_DIR if (BASE_DIR / "index.html").exists() else BASE_DIR / "frontend"
-KEY_FILE = BASE_DIR / ".vaultkey"
+KEY_FILE = CONFIG_DIR / ".vaultkey"
 
 # ── Encryption Helper ────────────────────────────────────────────────────────
 class Vault:
