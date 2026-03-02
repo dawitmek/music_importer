@@ -2,6 +2,7 @@
 """Music Vault Backend Server - Music Downloader & Library Manager"""
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -40,6 +41,86 @@ SONGS_FILE = DATA_DIR / "extracted_songs.json"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 # index.html may sit at root (flat) or inside frontend/ (nested)
 FRONTEND_DIR = BASE_DIR if (BASE_DIR / "index.html").exists() else BASE_DIR / "frontend"
+KEY_FILE = CONFIG_DIR / ".vault_key"
+
+# ── Encryption Helper ────────────────────────────────────────────────────────
+class Vault:
+    _memory_key: Optional[bytes] = None
+
+    @classmethod
+    def _get_key(cls) -> bytes:
+        # 1. Try memory (already loaded)
+        if cls._memory_key:
+            return cls._memory_key
+            
+        # 2. Try Docker Secrets (Highest security)
+        secret_path = Path("/run/secrets/MUSIC_VAULT_KEY")
+        if secret_path.exists():
+            try:
+                cls._memory_key = secret_path.read_bytes().strip()
+                if cls._memory_key:
+                    cls._memory_key = cls._memory_key.ljust(32, b'\0')[:32]
+                    return cls._memory_key
+            except Exception: pass
+
+        # 3. Try environment variable
+        env_key = os.environ.get("MUSIC_VAULT_KEY")
+        if env_key:
+            cls._memory_key = env_key.encode().ljust(32, b'\0')[:32]
+            return cls._memory_key
+
+        # 4. Fallback to local config file
+        if KEY_FILE.exists():
+            cls._memory_key = KEY_FILE.read_bytes()
+            return cls._memory_key
+            
+        # 4. Generate and save only if no environment variable is provided
+        # This ensures the app still works "out of the box"
+        key = os.urandom(32)
+        try:
+            KEY_FILE.write_bytes(key)
+            cls._memory_key = key
+        except Exception as e:
+            logger.error(f"Failed to save vault key: {e}")
+            # Fallback to a transient key if disk is read-only (not ideal for persistence)
+            cls._memory_key = key
+            
+        return cls._memory_key
+
+    @classmethod
+    def encrypt(cls, data: str) -> str:
+        if not data: return ""
+        key = cls._get_key()
+        raw = data.encode()
+        encrypted = bytearray()
+        for i in range(len(raw)):
+            encrypted.append(raw[i] ^ key[i % len(key)])
+        return base64.b64encode(encrypted).decode()
+
+    @classmethod
+    def decrypt(cls, data: str) -> str:
+        if not data: return ""
+        try:
+            key = cls._get_key()
+            raw = base64.b64decode(data)
+            decrypted = bytearray()
+            for i in range(len(raw)):
+                decrypted.append(raw[i] ^ key[i % len(key)])
+            return decrypted.decode()
+        except Exception:
+            return data
+
+def read_config_raw() -> str:
+    if not CONFIG_FILE.exists():
+        return ""
+    content = CONFIG_FILE.read_text()
+    if "[deezer]" not in content and "[downloads]" not in content:
+        return Vault.decrypt(content)
+    return content
+
+def write_config_raw(content: str):
+    encrypted = Vault.encrypt(content)
+    CONFIG_FILE.write_text(encrypted)
 
 for d in [SINGLES_DIR, PLAYLISTS_DIR, DATA_DIR, CONFIG_DIR, LOGS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
@@ -251,8 +332,8 @@ def read_arl() -> Optional[str]:
     if arl:
         return arl
     # Read from our config.toml
-    if CONFIG_FILE.exists():
-        content = CONFIG_FILE.read_text()
+    content = read_config_raw()
+    if content:
         m = re.search(r'arl\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', content)
         if m:
             val = m.group(1).strip()
@@ -362,9 +443,9 @@ async def process_download(item: dict):
     deezer_id = item.get("deezer_id")
     
     # Determine output directory
-    if item.get("type") == "playlist":
-        playlist_name = str(item.get("playlist_name") or "Unknown Playlist")
-        out_dir = PLAYLISTS_DIR / sanitize_filename(playlist_name) / sanitize_filename(f"{artist} - {title}" if artist else title)
+    playlist_name = item.get("playlist_name")
+    if playlist_name:
+        out_dir = PLAYLISTS_DIR / sanitize_filename(str(playlist_name)) / sanitize_filename(f"{artist} - {title}" if artist else title)
     else:
         out_dir = SINGLES_DIR / sanitize_filename(f"{artist} - {title}" if artist else title)
         
@@ -612,16 +693,17 @@ async def download_playlist(request):
     ids = []
     async with DOWNLOAD_LOCK:
         for t in tracks:
+            p_name = t.get("playlist_name")
             item = {
                 "id": str(uuid.uuid4()),
                 "title": t.get("title", "Unknown"),
                 "artist": t.get("artist", ""),
                 "deezer_id": t.get("deezer_id"),
                 "cover": t.get("cover", ""),
-                "playlist_name": t.get("playlist_name"),
+                "playlist_name": p_name,
                 "status": "pending",
                 "queued_at": time.time(),
-                "type": "playlist",
+                "type": "playlist" if p_name else "single",
             }
             DOWNLOAD_STATUS["queue"].append(item)
             ids.append(item["id"])
@@ -877,14 +959,14 @@ arl = "{arl}"
 folder = "{DOWNLOADS_DIR}"
 quality = "{quality}"
 """
-    CONFIG_FILE.write_text(toml_content)
+    write_config_raw(toml_content)
     return web.json_response({"ok": True})
 
 
 async def get_config(request):
     cfg = {"arl": "", "quality": "MP3_320", "deps": {}}
-    if CONFIG_FILE.exists():
-        content = CONFIG_FILE.read_text()
+    content = read_config_raw()
+    if content:
         m = re.search(r'arl\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', content)
         if m:
             cfg["arl"] = m.group(1)

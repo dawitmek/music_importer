@@ -66,7 +66,6 @@ setup_dirs() {
     "downloads/playlists"
     "data/logs"
     "config"
-    "frontend/static"
   )
   for d in "${dirs[@]}"; do
     mkdir -p "$d"

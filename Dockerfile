@@ -19,13 +19,14 @@ RUN pip install --no-cache-dir yt-dlp
 # streamrip (optional, may need Deezer ARL)
 RUN pip install --no-cache-dir streamrip || true
 
-# Copy app
-COPY backend/ ./backend/
-COPY frontend/ ./frontend/
+# Copy app files
+COPY server.py .
+COPY index.html .
+COPY static/ ./static/
 
 # Create directories
 RUN mkdir -p downloads/singles downloads/playlists data/logs config
 
 EXPOSE 8080
 
-CMD ["python", "backend/server.py"]
+CMD ["python", "server.py"]
