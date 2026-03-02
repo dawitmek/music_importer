@@ -260,18 +260,26 @@ function saveToHistory(type, value){
 function renderHistory(){
     const list = document.getElementById('history-list');
     const history = JSON.parse(localStorage.getItem('mv-history') || '[]');
+    list.innerHTML = '';
+    
     if(!history.length){
         list.innerHTML = `<div style="padding:10px;color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace">No recent activity</div>`;
         return;
     }
-    list.innerHTML = history.map((h, i) => {
+    
+    history.forEach((h, i) => {
         let label = typeof h.value === 'string' ? h.value : `${h.value.artist} - ${h.value.title}`;
         let icon = h.type === 'search' ? '🔍' : (h.type === 'playlist' ? '📋' : (h.type === 'manual' ? '✏️' : '🎵'));
-        return `<div class="history-item" onclick="applyHistory(${i})">
+        
+        const item = document.createElement('div');
+        item.className = 'history-item';
+        item.innerHTML = `
             <span class="history-icon">${icon}</span>
             <span class="history-val">${esc(label)}</span>
-        </div>`;
-    }).join('');
+        `;
+        item.addEventListener('click', () => applyHistory(i));
+        list.appendChild(item);
+    });
 }
 
 function applyHistory(index){
@@ -431,23 +439,39 @@ async function processCoverQueue() {
 }
 
 function renderSug(tracks){
-  lastSuggestions = tracks; // Store for index-based retrieval
+  lastSuggestions = tracks; 
+  sugEl.innerHTML = '';
+  
   if(!tracks.length){
     sugEl.innerHTML=`<div style="padding:20px;color:var(--dim);text-align:center;font-size:12px;font-family:'JetBrains Mono',monospace">No results found</div>`;
-    sugEl.classList.remove('hidden');return;
+    sugEl.classList.remove('hidden'); return;
   }
-  sugEl.innerHTML=tracks.map((t, idx)=>{
-    return `
-    <div class="suggestion-item" onclick='addToStagingIdx(${idx})'>
+
+  tracks.forEach((t, idx) => {
+    const item = document.createElement('div');
+    item.className = 'suggestion-item';
+    item.innerHTML = `
       <img class="sug-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
       <div class="sug-info">
         <div class="sug-title">${esc(t.title)}</div>
         <div class="sug-meta">${esc(t.artist)} · ${esc(t.album)}</div>
       </div>
       <span class="sug-dur">${fmtDur(t.duration)}</span>
-      <button class="sug-add-btn" onclick='event.stopPropagation(); addToStagingIdx(${idx})'>+ Stage</button>
-    </div>`;
-  }).join('');
+      <button class="sug-add-btn">+ Stage</button>
+    `;
+    
+    // Add event listeners directly to the elements
+    item.addEventListener('click', () => addToStagingIdx(idx));
+    
+    const btn = item.querySelector('.sug-add-btn');
+    btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        addToStagingIdx(idx);
+    });
+    
+    sugEl.appendChild(item);
+  });
+  
   sugEl.classList.remove('hidden');
 }
 
@@ -515,13 +539,24 @@ function renderStaging(){
   const el=document.getElementById('staging');
   const cnt=document.getElementById('staging-count');
   cnt.textContent=`${stagingTracks.length} track${stagingTracks.length!==1?'s':''} staged`;
-  if(!stagingTracks.length){el.innerHTML=`<div class="staging-empty">No tracks staged — search and add songs above</div>`;return;}
-  el.innerHTML=stagingTracks.map((t,i)=>`
-    <div class="staging-item">
-      <img class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
-      <div style="flex:1;min-width:0"><div class="staging-title">${esc(t.title)}</div><div class="staging-artist">${esc(t.artist||'—')}</div></div>
-      <button class="staging-remove" onclick="removeStaging(${i})">✕</button>
-    </div>`).join('');
+  el.innerHTML = '';
+  
+  if(!stagingTracks.length){
+      el.innerHTML=`<div class="staging-empty">No tracks staged — search and add songs above</div>`;
+      return;
+  }
+  
+  stagingTracks.forEach((t, i) => {
+      const item = document.createElement('div');
+      item.className = 'staging-item';
+      item.innerHTML = `
+        <img class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
+        <div style="flex:1;min-width:0"><div class="staging-title">${esc(t.title)}</div><div class="staging-artist">${esc(t.artist||'—')}</div></div>
+        <button class="staging-remove">✕</button>
+      `;
+      item.querySelector('.staging-remove').addEventListener('click', () => removeStaging(i));
+      el.appendChild(item);
+  });
 }
 function removeStaging(i){stagingTracks.splice(i,1);renderStaging();}
 document.getElementById('clear-staging').addEventListener('click',()=>{stagingTracks=[];renderStaging();});
