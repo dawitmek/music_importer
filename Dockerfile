@@ -1,13 +1,19 @@
-FROM python:3.14-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
 # System dependencies
+# streamrip often needs libsndfile1 and build tools for some dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
     git \
+    libsndfile1 \
+    build-essential \
     && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip
 
 # Python deps
 COPY requirements.txt .
@@ -16,8 +22,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # yt-dlp
 RUN pip install --no-cache-dir yt-dlp
 
-# streamrip (optional, may need Deezer ARL)
-RUN pip install --no-cache-dir streamrip || true
+# streamrip
+# We remove || true to ensure we know if it fails during build
+RUN pip install --no-cache-dir streamrip
 
 # Copy app files
 COPY server.py .
