@@ -163,28 +163,46 @@ function updateUI(s){
     ...f.slice(-5).reverse().map(x=>({...x,_cat:'fail'}))
   ];
   const ql=document.getElementById('queue-list');
+  ql.innerHTML = '';
+  
   if(!all.length){
     ql.innerHTML=`<div style="color:var(--dim);font-size:12px;padding:14px;font-family:'JetBrains Mono',monospace;letter-spacing:1px">— queue is empty —</div>`;
     return;
   }
-  ql.innerHTML=all.map((item,idx)=>{
+
+  all.forEach((item, idx) => {
     const status=item.status||(item._cat==='done'?'completed':item._cat==='fail'?'failed':'pending');
     const prog=status==='downloading'?`<div class="q-progress"><div class="q-progress-bar"></div></div>`:'';
     
-    let actionBtn = '';
-    if(['pending','downloading'].includes(status)){
-        actionBtn = `<button class="q-stop-btn" onclick="removeFromQueue('${item.id}')" title="Remove from queue">✕</button>`;
-    } else if(status === 'failed'){
-        actionBtn = `<button class="q-retry-btn" onclick="retryTrack('${item.id}')" title="Retry download">↻</button>`;
-    }
-
-    return `<div class="queue-item ${status}" style="animation-delay:${idx*.04}s">
+    const qItem = document.createElement('div');
+    qItem.className = `queue-item ${status}`;
+    qItem.style.animationDelay = `${idx*.04}s`;
+    qItem.innerHTML = `
       <img class="q-cover" src="/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}" onerror="this.src='/api/track-cover'" loading="lazy"/>
       <div class="q-info"><div class="q-title">${esc(item.title)}</div><div class="q-artist">${esc(item.artist||'—')}</div>${prog}</div>
       <span class="q-status ${status}">${status}</span>
-      ${actionBtn}
-    </div>`;
-  }).join('');
+      <div class="q-actions"></div>
+    `;
+
+    const actions = qItem.querySelector('.q-actions');
+    if(['pending','downloading'].includes(status)){
+        const stopBtn = document.createElement('button');
+        stopBtn.className = 'q-stop-btn';
+        stopBtn.innerHTML = '✕';
+        stopBtn.title = 'Remove from queue';
+        stopBtn.addEventListener('click', () => removeFromQueue(item.id));
+        actions.appendChild(stopBtn);
+    } else if(status === 'failed'){
+        const retryBtn = document.createElement('button');
+        retryBtn.className = 'q-retry-btn';
+        retryBtn.innerHTML = '↻';
+        retryBtn.title = 'Retry download';
+        retryBtn.addEventListener('click', () => retryTrack(item.id));
+        actions.appendChild(retryBtn);
+    }
+
+    ql.appendChild(qItem);
+  });
   updateLogs(s.logs||[]);
 }
 
@@ -706,9 +724,14 @@ function renderFiles(items){
   });
 
   const grid=document.getElementById('file-grid');
-  if(!filtered.length){grid.innerHTML=`<div style="color:var(--dim);font-size:12px;font-family:'JetBrains Mono',monospace;padding:20px;grid-column:1/-1;letter-spacing:1px">— no files found —</div>`;return;}
+  grid.innerHTML = '';
   
-  grid.innerHTML=filtered.map((f,idx)=>{
+  if(!filtered.length){
+      grid.innerHTML=`<div style="color:var(--dim);font-size:12px;font-family:'JetBrains Mono',monospace;padding:20px;grid-column:1/-1;letter-spacing:1px">— no files found —</div>`;
+      return;
+  }
+  
+  filtered.forEach((f, idx) => {
     const isDir = f.type === 'dir';
     
     // Determine layout based on viewMode
@@ -716,44 +739,64 @@ function renderFiles(items){
     if(viewMode === 'list') layoutClass = 'list-layout';
     else if(viewMode === 'grid') layoutClass = 'grid-layout';
     else {
-        // 'auto' mode: Folders are list, Files are grid
         layoutClass = isDir ? 'list-layout' : 'grid-layout';
     }
 
     const isAudio=['.mp3','.flac','.m4a','.wav','.ogg','.opus'].includes(f.ext);
     const isImage=['.jpg','.jpeg','.png','.webp','.gif'].includes(f.ext);
     
-    let icon = isDir ? '📁' : getFileIcon(f.ext);
+    let iconHTML = isDir ? '📁' : getFileIcon(f.ext);
     if(isImage) {
-        // Thumbnail size depends on layout, not just type
         const thumbSize = layoutClass === 'list-layout' ? '44px' : '80px';
-        icon = `<div style="width:${thumbSize};height:${thumbSize};display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:var(--radius);background:var(--bg)">
-                  <img src="/files/${urlEnc(f.path)}" style="width:100%;height:100%;object-fit:cover;"/>
-                </div>`;
+        iconHTML = `<div style="width:${thumbSize};height:${thumbSize};display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:var(--radius);background:var(--bg)">
+                      <img src="/files/${urlEnc(f.path)}" style="width:100%;height:100%;object-fit:cover;"/>
+                    </div>`;
     }
 
-    const actions = isDir 
-      ? `<div class="file-actions"><button class="fa-btn fa-zip" title="Zip" onclick="zipFolder('${esc(f.path)}',event)">🗜</button><button class="fa-btn fa-del" title="Delete" onclick="deleteFile('${esc(f.path)}',event)">🗑</button></div>`
-      : `<div class="file-actions">${isAudio?`<button class="fa-btn fa-play" title="Play" onclick="playFile('${esc(f.path)}','${esc(f.name)}',event)">▶</button>`:''}<button class="fa-btn fa-dl" title="Download" onclick="downloadFile('${esc(f.path)}',event)">⬇</button><button class="fa-btn fa-rename" title="Rename" onclick="renameFile('${esc(f.path)}','${esc(f.name)}',event)">✏</button><button class="fa-btn fa-del" title="Delete" onclick="deleteFile('${esc(f.path)}',event)">🗑</button></div>`;
+    const card = document.createElement('div');
+    card.className = `file-card ${layoutClass} ${selectedFiles.has(f.path) ? 'selected' : ''}`;
+    card.style.animationDelay = `${idx*.02}s`;
+    card.setAttribute('data-path', f.path);
     
-    const isSelected = selectedFiles.has(f.path);
-    const meta = isDir ? 'folder' : fmtBytes(f.size);
-
-    return `<div class="file-card ${layoutClass} ${isSelected ? 'selected' : ''}" style="animation-delay:${idx*.02}s" 
-                 data-path="${esc(f.path)}"
-                 onmousedown="onFileMouseDown('${esc(f.path)}', event)"
-                 onmouseup="onFileMouseUp('${esc(f.path)}', '${esc(f.type)}', event)"
-                 onmouseleave="onFileMouseLeave()"
-                 ontouchstart="onFileMouseDown('${esc(f.path)}', event)"
-                 ontouchend="onFileMouseUp('${esc(f.path)}', '${esc(f.type)}', event)">
-      <div class="file-icon">${icon}</div>
+    card.innerHTML = `
+      <div class="file-icon">${iconHTML}</div>
       <div class="file-info-wrap">
         <div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div>
-        <div class="file-meta">${meta}</div>
+        <div class="file-meta">${isDir ? 'folder' : fmtBytes(f.size)}</div>
       </div>
-      ${actions}
-    </div>`;
-  }).join('');
+      <div class="file-actions"></div>
+    `;
+
+    const actionsContainer = card.querySelector('.file-actions');
+    if (isDir) {
+        actionsContainer.appendChild(createActionBtn('fa-zip', '🗜', 'Zip', (e) => zipFolder(f.path, e)));
+        actionsContainer.appendChild(createActionBtn('fa-del', '🗑', 'Delete', (e) => deleteFile(f.path, e)));
+    } else {
+        if (isAudio) {
+            actionsContainer.appendChild(createActionBtn('fa-play', '▶', 'Play', (e) => playFile(f.path, f.name, e)));
+        }
+        actionsContainer.appendChild(createActionBtn('fa-dl', '⬇', 'Download', (e) => downloadFile(f.path, e)));
+        actionsContainer.appendChild(createActionBtn('fa-rename', '✏', 'Rename', (e) => renameFile(f.path, f.name, e)));
+        actionsContainer.appendChild(createActionBtn('fa-del', '🗑', 'Delete', (e) => deleteFile(f.path, e)));
+    }
+
+    card.onmousedown = (e) => onFileMouseDown(f.path, e);
+    card.onmouseup = (e) => onFileMouseUp(f.path, f.type, e);
+    card.onmouseleave = () => onFileMouseLeave();
+    card.ontouchstart = (e) => onFileMouseDown(f.path, e);
+    card.ontouchend = (e) => onFileMouseUp(f.path, f.type, e);
+
+    grid.appendChild(card);
+  });
+}
+
+function createActionBtn(cls, icon, title, onClick) {
+    const btn = document.createElement('button');
+    btn.className = `fa-btn ${cls}`;
+    btn.innerHTML = icon;
+    btn.title = title;
+    btn.addEventListener('click', onClick);
+    return btn;
 }
 
 function onFileMouseDown(path, e){
@@ -804,14 +847,32 @@ function viewImage(path){
 }
 function updateBreadcrumb(path){
   const el=document.getElementById('breadcrumb');
-  const parts=path?path.split('/').filter(Boolean):[];
-  let html=`<span class="bread-part ${!parts.length?'active':''}" onclick="loadFiles('')">⌂ Root</span>`;
+  const parts=path?path.split('/'):[];
+  el.innerHTML='';
+
+  const rootSpan = document.createElement('span');
+  rootSpan.className = `bread-part ${!parts.length?'active':''}`;
+  rootSpan.textContent = '⌂ Root';
+  rootSpan.addEventListener('click', () => loadFiles(''));
+  el.appendChild(rootSpan);
+
   parts.forEach((p,i)=>{
-    const sub=parts.slice(0,i+1).join('/');const last=i===parts.length-1;
-    html+=`<span class="bread-sep">/</span><span class="bread-part ${last?'active':''}" onclick="loadFiles('${esc(sub)}')">${esc(p)}</span>`;
+    const sep = document.createElement('span');
+    sep.className = 'bread-sep';
+    sep.textContent = '/';
+    el.appendChild(sep);
+
+    const sub=parts.slice(0,i+1).join('/');
+    const last=i===parts.length-1;
+
+    const partSpan = document.createElement('span');
+    partSpan.className = `bread-part ${last?'active':''}`;
+    partSpan.textContent = p;
+    partSpan.addEventListener('click', () => loadFiles(sub));
+    el.appendChild(partSpan);
   });
-  el.innerHTML=html;
 }
+
 document.getElementById('fm-search').addEventListener('input',()=>loadFiles());
 document.getElementById('view-toggle-btn').addEventListener('click', function(){
     if(viewMode === 'auto') viewMode = 'grid';
