@@ -395,6 +395,9 @@ async function processCoverQueue() {
 
     processingCover = true;
     const track = coverQueue.shift();
+    
+    // Track retry attempts
+    if (track.coverRetries === undefined) track.coverRetries = 0;
 
     try {
         const r = await fetch(`/api/track-cover?artist=${enc(track.artist)}&title=${enc(track.title)}`);
@@ -405,13 +408,22 @@ async function processCoverQueue() {
                 staged.cover = URL.createObjectURL(blob);
                 renderStaging();
             }
+        } else {
+            throw new Error(`Status ${r.status}`);
         }
     } catch (e) {
-        console.warn("Failed to fetch cover in background", e);
+        console.warn(`Failed to fetch cover for ${track.title} (Attempt ${track.coverRetries + 1}/3)`, e);
+        
+        if (track.coverRetries < 2) { // 0, 1, 2 = 3 attempts total
+            track.coverRetries++;
+            // Push back to the end of the queue to try again later
+            coverQueue.push(track);
+        }
     }
 
-    // Small delay between requests to be gentle
-    setTimeout(processCoverQueue, 100);
+    // Small delay between requests to be gentle. 
+    // If we just failed, we might want to wait a bit longer, but sequential processing naturally provides some gap.
+    setTimeout(processCoverQueue, 150);
 }
 
 function renderSug(tracks){
