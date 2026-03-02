@@ -8,11 +8,10 @@ services:
       - ./downloads:/app/downloads
       - ./data:/app/data
       - ./config:/app/config
+      - ./.vaultkey:/app/.vaultkey
     environment:
       - PYTHONUNBUFFERED=1
-    command: >
-      sh -c "export MUSIC_VAULT_KEY=$$(head -c 32 /dev/urandom | base64) &&
-             python server.py"
+    command: python server.py
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]

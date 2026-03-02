@@ -41,7 +41,7 @@ SONGS_FILE = DATA_DIR / "extracted_songs.json"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 # index.html may sit at root (flat) or inside frontend/ (nested)
 FRONTEND_DIR = BASE_DIR if (BASE_DIR / "index.html").exists() else BASE_DIR / "frontend"
-KEY_FILE = CONFIG_DIR / ".vault_key"
+KEY_FILE = BASE_DIR / ".vaultkey"
 
 # ── Encryption Helper ────────────────────────────────────────────────────────
 class Vault:
@@ -53,7 +53,18 @@ class Vault:
         if cls._memory_key:
             return cls._memory_key
             
-        # 2. Try Docker Secrets (Highest security)
+        # 2. Try local file (.vaultkey) — Primary source for persistence
+        if KEY_FILE.exists():
+            try:
+                cls._memory_key = KEY_FILE.read_bytes().strip()
+                if cls._memory_key:
+                    # Ensure it's padded/truncated to 32 bytes for consistency
+                    cls._memory_key = cls._memory_key.ljust(32, b'\0')[:32]
+                    return cls._memory_key
+            except Exception as e:
+                logger.error(f"Failed to read vault key from file: {e}")
+
+        # 3. Try Docker Secrets (High security)
         secret_path = Path("/run/secrets/MUSIC_VAULT_KEY")
         if secret_path.exists():
             try:
@@ -63,23 +74,19 @@ class Vault:
                     return cls._memory_key
             except Exception: pass
 
-        # 3. Try environment variable
+        # 4. Try environment variable (Secondary source)
         env_key = os.environ.get("MUSIC_VAULT_KEY")
         if env_key:
             cls._memory_key = env_key.encode().ljust(32, b'\0')[:32]
             return cls._memory_key
-
-        # 4. Fallback to local config file
-        if KEY_FILE.exists():
-            cls._memory_key = KEY_FILE.read_bytes()
-            return cls._memory_key
             
-        # 4. Generate and save only if no environment variable is provided
-        # This ensures the app still works "out of the box"
+        # 5. Generate and save if nothing else is found
+        # This ensures the app still works "out of the box" and persists to the file
         key = os.urandom(32)
         try:
             KEY_FILE.write_bytes(key)
             cls._memory_key = key
+            logger.info(f"Generated new vault key and saved to {KEY_FILE}")
         except Exception as e:
             logger.error(f"Failed to save vault key: {e}")
             # Fallback to a transient key if disk is read-only (not ideal for persistence)
