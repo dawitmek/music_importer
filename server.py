@@ -412,12 +412,12 @@ async def run_streamrip(track_id: str, out_dir: Path) -> bool:
                 "not found" # Sometimes streamrip reports not found for forbidden quality
             ]
             
-            if proc.returncode != 0 or any(k.lower() in out.lower() for k in error_keywords):
+            if proc.returncode != 0:
+                logger.warning(f"streamrip exited {proc.returncode} for quality {q}. Output: {out[:300]}")
                 if any(k.lower() in out.lower() for k in error_keywords):
                     add_log(f"Quality {q} not supported by this account. Stepping down...", "WARNING")
                     continue
                 else:
-                    logger.warning(f"streamrip exited {proc.returncode} for quality {q}")
                     continue
 
             # Verify a file appeared
@@ -432,7 +432,11 @@ async def run_streamrip(track_id: str, out_dir: Path) -> bool:
                         DEEZER_MAX_QUALITY = q
                         add_log(f"Account capability locked to quality level {q}")
                 return True
-                
+
+        except FileNotFoundError:
+            logger.error("The 'rip' command was not found in the system PATH.")
+            add_log("Streamrip (rip) command not found. Using YouTube fallback.", "ERROR")
+            return False
         except asyncio.TimeoutError:
             logger.warning(f"streamrip timed out at quality {q}")
             continue
@@ -1041,7 +1045,15 @@ async def get_config(request):
             cfg["quality"] = m.group(1)
             
     # Check dependencies
-    cfg["deps"]["streamrip"] = shutil.which("rip") is not None
+    # Standard check
+    rip_path = shutil.which("rip")
+    # Fallback for pipx if not in immediate shutil path during runtime
+    if not rip_path:
+        pipx_rip = Path("/root/.local/bin/rip")
+        if pipx_rip.exists():
+            rip_path = str(pipx_rip)
+
+    cfg["deps"]["streamrip"] = rip_path is not None
     cfg["deps"]["ytdlp"] = shutil.which("yt-dlp") is not None
     cfg["download_path"] = str(DOWNLOADS_DIR)
     
