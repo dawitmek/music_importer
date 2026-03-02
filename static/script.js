@@ -96,18 +96,18 @@ function updateUI(s){
   if(document.getElementById('dash-done')) document.getElementById('dash-done').textContent = c.length;
   if(document.getElementById('dash-fail')) document.getElementById('dash-fail').textContent = f.length;
 
-    const lastCompleteEl = document.getElementById('dash-last-complete');
-    if(lastCompleteEl && s.last_batch_finished_at) {
-        const date = new Date(s.last_batch_finished_at * 1000);
-        // toLocaleString automatically uses the browser's local timezone
-        lastCompleteEl.textContent = date.toLocaleString([], {
-            month: 'short', 
-            day: 'numeric',
-            hour: '2-digit', 
-            minute: '2-digit'
-        });
-        lastCompleteEl.style.fontSize = '14px';
-    }
+  const lastCompleteEl = document.getElementById('dash-last-complete');
+  if(lastCompleteEl && s.last_batch_finished_at) {
+      const date = new Date(s.last_batch_finished_at * 1000);
+      // Automatically converts to browser's local timezone
+      lastCompleteEl.textContent = date.toLocaleString([], {
+          month: 'short', 
+          day: 'numeric',
+          hour: '2-digit', 
+          minute: '2-digit'
+      });
+      lastCompleteEl.style.fontSize = '14px';
+  }
 
   // Update Dashboard System Status
   const statusTitle = document.getElementById('dash-status-title');
@@ -122,6 +122,7 @@ function updateUI(s){
       statusDetail.textContent = `${current.artist} - ${current.title}`;
       statusSub.textContent = q.length > 0 ? `${q.length} IN QUEUE` : 'FINALIZING';
       statusSub.style.color = 'var(--cyan)';
+      statusSub.style.fontWeight = '800';
       statusSub.style.background = 'var(--cyan-dim)';
       if(statusCover) {
           statusCover.src = current.cover || `/api/track-cover?artist=${enc(current.artist)}&title=${enc(current.title)}`;
@@ -134,6 +135,7 @@ function updateUI(s){
       statusDetail.textContent = `${first.artist} - ${first.title}`;
       statusSub.textContent = `${q.length} PENDING`;
       statusSub.style.color = 'var(--cyan)';
+      statusSub.style.fontWeight = '800';
       statusSub.style.background = 'var(--cyan-dim)';
       if(statusCover) {
           statusCover.src = first.cover || `/api/track-cover?artist=${enc(first.artist)}&title=${enc(first.title)}`;
@@ -146,6 +148,7 @@ function updateUI(s){
       statusSub.textContent = 'READY';
       statusSub.style.color = 'var(--muted)';
       statusSub.style.background = 'transparent';
+      statusSub.style.fontWeight = '600';
       if(statusCover) statusCover.style.display = 'none';
   }
 

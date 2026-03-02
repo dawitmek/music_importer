@@ -443,6 +443,12 @@ body {
   gap: 16px;
   justify-content: flex-start;
   align-items: center;
+  flex: 1;
+}
+.sess-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
 }
 
 .session-stats {
