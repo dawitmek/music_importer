@@ -50,10 +50,11 @@
 
 // ── State ────────────────────────────────
 let ws=null,wsStatus={},stagingTracks=[];
-let currentPath='',sortBy='name',sortDir=1,autoScroll=true;
+let currentPath='',sortBy='date',sortDir=-1,autoScroll=true;
 let selectedFiles = new Set();
 let isMultiSelectMode = false;
 let longPressTimer = null;
+let viewMode = 'auto'; // 'auto', 'grid', 'list'
 
 // ── WebSocket ────────────────────────────
 function connectWS(){
@@ -535,28 +536,60 @@ function toggleFileSelection(path, cardEl){
 function renderFiles(items){
   const filter=document.getElementById('fm-search').value.toLowerCase();
   let filtered=items.filter(f=>f.name.toLowerCase().includes(filter));
+  
   filtered.sort((a,b)=>{
-    if(a.type!==b.type)return a.type==='dir'?-1:1;
-    const cmp=sortBy==='name'?a.name.localeCompare(b.name):sortBy==='size'?a.size-b.size:a.modified-b.modified;
+    if(a.type!==b.type) return a.type==='dir'?-1:1;
+    const cmp=sortBy=== 'name' ? a.name.localeCompare(b.name) : sortBy === 'size' ? a.size - b.size : a.modified - b.modified;
     return cmp*sortDir;
   });
+
   const grid=document.getElementById('file-grid');
   if(!filtered.length){grid.innerHTML=`<div style="color:var(--dim);font-size:12px;font-family:'JetBrains Mono',monospace;padding:20px;grid-column:1/-1;letter-spacing:1px">— no files found —</div>`;return;}
+  
   grid.innerHTML=filtered.map((f,idx)=>{
-    const icon=f.type==='dir'?'📁':getFileIcon(f.ext);
+    const isDir = f.type === 'dir';
+    
+    // Determine layout based on viewMode
+    let layoutClass = 'grid-layout';
+    if(viewMode === 'list') layoutClass = 'list-layout';
+    else if(viewMode === 'grid') layoutClass = 'grid-layout';
+    else {
+        // 'auto' mode: Folders are list, Files are grid
+        layoutClass = isDir ? 'list-layout' : 'grid-layout';
+    }
+
     const isAudio=['.mp3','.flac','.m4a','.wav','.ogg','.opus'].includes(f.ext);
-    const actions=f.type==='dir'?`<div class="file-actions"><button class="fa-btn fa-zip" title="Zip" onclick="zipFolder('${esc(f.path)}',event)">🗜</button><button class="fa-btn fa-del" title="Delete" onclick="deleteFile('${esc(f.path)}',event)">🗑</button></div>`
-      :`<div class="file-actions">${isAudio?`<button class="fa-btn fa-play" title="Play" onclick="playFile('${esc(f.path)}','${esc(f.name)}',event)">▶</button>`:''}<button class="fa-btn fa-dl" title="Download" onclick="downloadFile('${esc(f.path)}',event)">⬇</button><button class="fa-btn fa-rename" title="Rename" onclick="renameFile('${esc(f.path)}','${esc(f.name)}',event)">✏</button><button class="fa-btn fa-del" title="Delete" onclick="deleteFile('${esc(f.path)}',event)">🗑</button></div>`;
+    const isImage=['.jpg','.jpeg','.png','.webp','.gif'].includes(f.ext);
+    
+    let icon = isDir ? '📁' : getFileIcon(f.ext);
+    if(isImage) {
+        // Thumbnail size depends on layout, not just type
+        const thumbSize = layoutClass === 'list-layout' ? '44px' : '80px';
+        icon = `<div style="width:${thumbSize};height:${thumbSize};display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:var(--radius);background:var(--bg)">
+                  <img src="/files/${urlEnc(f.path)}" style="width:100%;height:100%;object-fit:cover;"/>
+                </div>`;
+    }
+
+    const actions = isDir 
+      ? `<div class="file-actions"><button class="fa-btn fa-zip" title="Zip" onclick="zipFolder('${esc(f.path)}',event)">🗜</button><button class="fa-btn fa-del" title="Delete" onclick="deleteFile('${esc(f.path)}',event)">🗑</button></div>`
+      : `<div class="file-actions">${isAudio?`<button class="fa-btn fa-play" title="Play" onclick="playFile('${esc(f.path)}','${esc(f.name)}',event)">▶</button>`:''}<button class="fa-btn fa-dl" title="Download" onclick="downloadFile('${esc(f.path)}',event)">⬇</button><button class="fa-btn fa-rename" title="Rename" onclick="renameFile('${esc(f.path)}','${esc(f.name)}',event)">✏</button><button class="fa-btn fa-del" title="Delete" onclick="deleteFile('${esc(f.path)}',event)">🗑</button></div>`;
     
     const isSelected = selectedFiles.has(f.path);
-    return `<div class="file-card ${isSelected ? 'selected' : ''}" style="animation-delay:${idx*.03}s" 
+    const meta = isDir ? 'folder' : fmtBytes(f.size);
+
+    return `<div class="file-card ${layoutClass} ${isSelected ? 'selected' : ''}" style="animation-delay:${idx*.02}s" 
                  onmousedown="onFileMouseDown('${esc(f.path)}', event)"
                  onmouseup="onFileMouseUp('${esc(f.path)}', '${esc(f.type)}', event)"
                  onmouseleave="onFileMouseLeave()"
                  ontouchstart="onFileMouseDown('${esc(f.path)}', event)"
                  ontouchend="onFileMouseUp('${esc(f.path)}', '${esc(f.type)}', event)">
-      <div class="file-icon">${icon}</div><div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div>
-      <div class="file-meta">${f.type==='dir'?'folder':fmtBytes(f.size)}</div>${actions}</div>`;
+      <div class="file-icon">${icon}</div>
+      <div class="file-info-wrap">
+        <div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div>
+        <div class="file-meta">${meta}</div>
+      </div>
+      ${actions}
+    </div>`;
   }).join('');
 }
 
@@ -591,7 +624,21 @@ function onFileMouseLeave(){
     }
 }
 
-function fileClick(path,type){if(type==='dir')loadFiles(path);}
+function fileClick(path,type){
+    if(type==='dir') loadFiles(path);
+    else {
+        const ext = path.split('.').pop().toLowerCase();
+        if(['jpg','jpeg','png','webp','gif'].includes(ext)){
+            viewImage(path);
+        }
+    }
+}
+
+function viewImage(path){
+    const img = document.getElementById('viewer-img');
+    img.src = `/files/${urlEnc(path)}`;
+    openModal('image-modal');
+}
 function updateBreadcrumb(path){
   const el=document.getElementById('breadcrumb');
   const parts=path?path.split('/').filter(Boolean):[];
@@ -603,6 +650,14 @@ function updateBreadcrumb(path){
   el.innerHTML=html;
 }
 document.getElementById('fm-search').addEventListener('input',()=>loadFiles());
+document.getElementById('view-toggle-btn').addEventListener('click', function(){
+    if(viewMode === 'auto') viewMode = 'grid';
+    else if(viewMode === 'grid') viewMode = 'list';
+    else viewMode = 'auto';
+    
+    this.textContent = viewMode === 'auto' ? '▦ Auto' : (viewMode === 'grid' ? '▤ Grid' : '☰ List');
+    loadFiles();
+});
 document.querySelectorAll('.sort-btn').forEach(btn=>{
   btn.addEventListener('click',()=>{
     const s=btn.dataset.sort;
@@ -615,18 +670,24 @@ document.querySelectorAll('.sort-btn').forEach(btn=>{
 function playFile(path,name,e){
   e&&e.stopPropagation();
   const audio=document.getElementById('audio-el');
-  audio.src=`/files/${path}`;audio.play();
+  audio.src=`/files/${urlEnc(path)}`;audio.play();
   document.getElementById('player-title').textContent=decodeURIComponent(name.replace(/\.[^.]+$/,''));
   document.getElementById('player-artist').textContent='—';
   document.getElementById('play-btn').innerHTML='⏸';
   document.getElementById('vinyl-disc').classList.add('spinning');
   document.getElementById('eq-bars').classList.add('active');
-  const folder=path.substring(0,path.lastIndexOf('/'));
-  document.getElementById('player-cover').src=`/api/track-cover?folder=${enc('/downloads/'+folder)}`;
+  
+  // path is relative to DOWNLOADS_DIR, e.g. "singles/Artist - Song/song.mp3"
+  // folder should be "singles/Artist - Song"
+  const parts = path.split('/');
+  parts.pop(); // Remove filename
+  const folder = parts.join('/');
+  
+  document.getElementById('player-cover').src=`/api/track-cover?folder=${enc(folder)}`;
 }
 function downloadFile(path,e){
   e&&e.stopPropagation();
-  const a=document.createElement('a');a.href=`/files/${path}`;a.download=path.split('/').pop();a.click();
+  const a=document.createElement('a');a.href=`/files/${urlEnc(path)}`;a.download=path.split('/').pop();a.click();
 }
 async function renameFile(path,name,e){
   e&&e.stopPropagation();
@@ -752,6 +813,9 @@ function toast(msg,type='info'){
 
 // ── Utils ─────────────────────────────────
 function enc(s){return encodeURIComponent(s||'')}
+function urlEnc(path){
+    return (path||'').split('/').map(p => encodeURIComponent(p)).join('/');
+}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;')}
 function fmtDur(s){s=Math.floor(s||0);return`${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`}
 function fmtBytes(b){if(!b)return'0 B';const u=['B','KB','MB','GB'];const i=Math.floor(Math.log(b)/Math.log(1024));return`${(b/Math.pow(1024,i)).toFixed(1)} ${u[i]}`}

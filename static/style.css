@@ -1218,7 +1218,8 @@ body {
 .file-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(185px, 1fr));
-  gap: 10px;
+  gap: 12px;
+  align-items: start;
 }
 .batch-toolbar {
   background: var(--bg3);
@@ -1241,7 +1242,6 @@ body {
   background: var(--bg3);
   border: 1px solid var(--border);
   border-radius: var(--radius2);
-  padding: 16px;
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
   position: relative;
@@ -1250,6 +1250,67 @@ body {
   user-select: none;
   -webkit-user-select: none;
 }
+
+/* Grid Layout (Box) */
+.file-card.grid-layout {
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+}
+.file-card.grid-layout .file-icon {
+  width: 80px;
+  height: 80px;
+  font-size: 40px;
+  margin-bottom: 14px;
+}
+.file-card.grid-layout .file-icon div,
+.file-card.grid-layout .file-icon img {
+  width: 80px !important;
+  height: 80px !important;
+  border-radius: var(--radius);
+}
+
+/* List Layout (Detail Tile) */
+.file-card.list-layout {
+  grid-column: 1 / -1;
+  padding: 10px 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  text-align: left;
+}
+.file-card.list-layout .file-icon {
+  width: 44px;
+  height: 44px;
+  font-size: 24px;
+  margin-bottom: 0;
+}
+.file-card.list-layout .file-icon div,
+.file-card.list-layout .file-icon img {
+  width: 44px !important;
+  height: 44px !important;
+  border-radius: 4px;
+}
+.file-card.list-layout .file-info-wrap {
+  flex: 1;
+  min-width: 0;
+}
+.file-card.list-layout .file-name {
+  margin-bottom: 2px;
+  font-size: 14px;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.file-card.list-layout .file-actions {
+  position: static;
+  opacity: 1;
+  background: none;
+  padding: 0;
+}
+
 .file-card.selected {
   border-color: var(--cyan);
   background: var(--cyan-dim);
@@ -1303,9 +1364,19 @@ body {
   opacity: 0.5;
 }
 .file-icon {
-  font-size: 28px;
-  margin-bottom: 10px;
   line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.file-icon div, .file-icon img {
+  width: 80px !important;
+  height: 80px !important;
+  border-radius: var(--radius);
 }
 .file-name {
   font-size: 12px;

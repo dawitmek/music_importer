@@ -168,7 +168,7 @@ refresh_token = ""
 token_expiry = ""
 
 [deezer]
-quality = 2
+quality = __QUALITY__
 arl = "__ARL__"
 use_deezloader = true
 deezloader_warnings = true
@@ -246,6 +246,7 @@ DOWNLOAD_STATUS: dict = {
     "failed": [],
     "logs": [],
 }
+DEEZER_MAX_QUALITY = None  # Persistent memory for account capability (0, 1, 2, 3)
 DOWNLOAD_LOCK = asyncio.Lock()
 
 
@@ -305,7 +306,8 @@ DEEZER_BASE = "https://api.deezer.com"
 
 
 def sanitize_filename(name: str) -> str:
-    name = re.sub(r'[<>:"/\\|?*]', "", name)
+    # Adding # to prevent URL fragment issues
+    name = re.sub(r'[<>:"/\\|?*#]', "", name)
     name = re.sub(r"\s+", " ", name).strip()
     return name[:200]
 
@@ -344,51 +346,94 @@ def read_arl() -> Optional[str]:
 
 # ── Download engine ────────────────────────────────────────────────────────────
 async def run_streamrip(track_id: str, out_dir: Path) -> bool:
+    global DEEZER_MAX_QUALITY
     arl = read_arl()
     if not arl:
         logger.warning("No ARL configured — skipping streamrip")
         return False
 
+    # Get user's preferred quality from config
+    user_quality = 1 # Default 320kbps
+    if CONFIG_FILE.exists():
+        content = read_config_raw()
+        m = re.search(r'quality\s*=\s*"([^"]*)"', content)
+        if m:
+            q_str = m.group(1)
+            if q_str == "FLAC": user_quality = 2
+            elif q_str == "MP3_320": user_quality = 1
+            elif q_str == "MP3_128": user_quality = 0
+
+    # Start from the lower of (User Preference) vs (Last Known Max Capability)
+    starting_quality = user_quality
+    if DEEZER_MAX_QUALITY is not None:
+        starting_quality = min(user_quality, DEEZER_MAX_QUALITY)
+
+    # Qualities to try in descending order (2=FLAC, 1=320, 0=128)
+    qualities_to_try = [q for q in [2, 1, 0] if q <= starting_quality]
+    
     sr_config = CONFIG_DIR / "streamrip_config.toml"
 
-    # Write complete valid streamrip 2.x config from template
-    try:
-        cfg_text = STREAMRIP_CONFIG_TEMPLATE.replace("__ARL__", arl).replace("__FOLDER__", str(out_dir))
-        sr_config.write_text(cfg_text)
-    except Exception as e:
-        logger.warning(f"Failed to write streamrip config: {e}")
-        return False
+    for q in qualities_to_try:
+        add_log(f"Attempting Deezer download at quality level {q}...")
+        
+        try:
+            cfg_text = STREAMRIP_CONFIG_TEMPLATE.replace("__ARL__", arl) \
+                                              .replace("__FOLDER__", str(out_dir)) \
+                                              .replace("__QUALITY__", str(q))
+            sr_config.write_text(cfg_text)
+        except Exception as e:
+            logger.warning(f"Failed to write streamrip config: {e}")
+            return False
 
-    # Step 3: run the download
-    cmd = ["rip", "--config-path", str(sr_config), "url",
-           f"https://www.deezer.com/track/{track_id}"]
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
-        out = (stdout + stderr).decode(errors="replace")
-        if out.strip():
-            logger.info(f"streamrip output: {out[:600]}")
-        if proc.returncode != 0:
-            logger.warning(f"streamrip exited {proc.returncode}")
-            return False
-        # Verify a file actually appeared in out_dir
-        files = list(out_dir.glob("*.*"))
-        audio_exts = {".flac", ".mp3", ".m4a", ".ogg", ".opus"}
-        has_audio = any(f.suffix.lower() in audio_exts for f in files)
-        if not has_audio:
-            logger.warning(f"streamrip returned 0 but no audio file found in {out_dir}")
-            return False
-        return True
-    except asyncio.TimeoutError:
-        logger.warning("streamrip timed out")
-        return False
-    except FileNotFoundError:
-        logger.warning("streamrip (rip) not found in PATH")
-        return False
+        cmd = ["rip", "--config-path", str(sr_config), "url",
+               f"https://www.deezer.com/track/{track_id}"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+            out = (stdout + stderr).decode(errors="replace")
+            
+            # Look for quality errors
+            error_keywords = [
+                "not available for your account",
+                "does not support",
+                "Codec not available",
+                "not authorized",
+                "not found" # Sometimes streamrip reports not found for forbidden quality
+            ]
+            
+            if proc.returncode != 0 or any(k.lower() in out.lower() for k in error_keywords):
+                if any(k.lower() in out.lower() for k in error_keywords):
+                    add_log(f"Quality {q} not supported by this account. Stepping down...", "WARNING")
+                    continue
+                else:
+                    logger.warning(f"streamrip exited {proc.returncode} for quality {q}")
+                    continue
+
+            # Verify a file appeared
+            files = list(out_dir.glob("*.*"))
+            audio_exts = {".flac", ".mp3", ".m4a", ".ogg", ".opus"}
+            if any(f.suffix.lower() in audio_exts for f in files):
+                # SUCCESS! Remember this quality level
+                if DEEZER_MAX_QUALITY is None or q > DEEZER_MAX_QUALITY:
+                    # We only update if we haven't set it yet, or found a higher one (unlikely in step-down)
+                    # but if we started at a lower preference, don't assume we can do higher
+                    if DEEZER_MAX_QUALITY is None:
+                        DEEZER_MAX_QUALITY = q
+                        add_log(f"Account capability locked to quality level {q}")
+                return True
+                
+        except asyncio.TimeoutError:
+            logger.warning(f"streamrip timed out at quality {q}")
+            continue
+        except Exception as e:
+            logger.error(f"streamrip error at quality {q}: {e}")
+            continue
+
+    return False
 
 
 async def run_ytdlp(query: str, out_dir: Path, filename: str) -> bool:
@@ -420,14 +465,21 @@ async def run_ytdlp(query: str, out_dir: Path, filename: str) -> bool:
         # yt-dlp saves it as "{safe}.jpg" (after --convert-thumbnails jpg)
         cover_src = out_dir / f"{safe}.jpg"
         cover_dst = out_dir / "cover.jpg"
-        if cover_src.exists() and cover_src != cover_dst:
-            shutil.copy2(str(cover_src), str(cover_dst))
+        if cover_src.exists():
+            if cover_src != cover_dst:
+                shutil.copy2(str(cover_src), str(cover_dst))
+                # Remove the original to prevent duplicates
+                try: cover_src.unlink()
+                except: pass
             logger.info(f"Saved cover art to {cover_dst}")
         else:
             # Fallback: search for any jpg/webp thumbnail yt-dlp may have written
             for thumb in out_dir.glob(f"{safe}.*"):
                 if thumb.suffix.lower() in {".jpg", ".jpeg", ".webp", ".png"}:
                     shutil.copy2(str(thumb), str(cover_dst))
+                    # Remove the original
+                    try: thumb.unlink()
+                    except: pass
                     logger.info(f"Saved cover art (fallback) to {cover_dst}")
                     break
 
@@ -803,8 +855,10 @@ async def track_cover(request):
 
     # 1. Check local cover.jpg
     if folder:
+        # folder is relative to DOWNLOADS_DIR
+        base = DOWNLOADS_DIR / folder
         for name in ["cover.jpg", "cover.png", "folder.jpg", "folder.png"]:
-            p = Path(folder) / name
+            p = base / name
             if p.exists():
                 return web.FileResponse(p)
 
@@ -843,15 +897,17 @@ async def list_files(request):
 
     items = []
     try:
+        # Use target.iterdir() but ensure paths are relative to DOWNLOADS_DIR for frontend
         for entry in sorted(target.iterdir(), key=lambda e: (e.is_file(), e.name.lower())):
             stat = entry.stat()
+            rel_path = str(entry.relative_to(DOWNLOADS_DIR))
             items.append({
                 "name": entry.name,
                 "type": "file" if entry.is_file() else "dir",
                 "size": stat.st_size if entry.is_file() else 0,
                 "modified": stat.st_mtime,
                 "ext": entry.suffix.lower() if entry.is_file() else "",
-                "path": str(entry.relative_to(base)),
+                "path": rel_path,
             })
     except PermissionError:
         pass
@@ -949,6 +1005,7 @@ async def get_status(request):
 
 
 async def save_config(request):
+    global DEEZER_MAX_QUALITY
     body = await request.json()
     arl = body.get("arl", "")
     quality = body.get("quality", "MP3_320")
@@ -960,6 +1017,8 @@ folder = "{DOWNLOADS_DIR}"
 quality = "{quality}"
 """
     write_config_raw(toml_content)
+    # Reset probing memory when config changes
+    DEEZER_MAX_QUALITY = None
     return web.json_response({"ok": True})
 
 
