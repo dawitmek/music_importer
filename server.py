@@ -392,7 +392,14 @@ async def run_streamrip(track_id: str, out_dir: Path) -> bool:
             logger.warning(f"Failed to write streamrip config: {e}")
             return False
 
-        cmd = ["rip", "--config-path", str(sr_config), "url",
+        # Standard check
+        rip_cmd = "rip"
+        if not shutil.which(rip_cmd):
+            pipx_rip = Path("/root/.local/bin/rip")
+            if pipx_rip.exists():
+                rip_cmd = str(pipx_rip)
+
+        cmd = [rip_cmd, "--config-path", str(sr_config), "url",
                f"https://www.deezer.com/track/{track_id}"]
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -413,7 +420,7 @@ async def run_streamrip(track_id: str, out_dir: Path) -> bool:
             ]
             
             if proc.returncode != 0:
-                logger.warning(f"streamrip exited {proc.returncode} for quality {q}. Output: {out[:300]}")
+                add_log(f"streamrip exited {proc.returncode} for quality {q}. Output: {out[:300]}", "WARNING")
                 if any(k.lower() in out.lower() for k in error_keywords):
                     add_log(f"Quality {q} not supported by this account. Stepping down...", "WARNING")
                     continue
@@ -434,8 +441,7 @@ async def run_streamrip(track_id: str, out_dir: Path) -> bool:
                 return True
 
         except FileNotFoundError:
-            logger.error("The 'rip' command was not found in the system PATH.")
-            add_log("Streamrip (rip) command not found. Using YouTube fallback.", "ERROR")
+            add_log("The 'rip' command was not found in the system PATH. Using YouTube fallback.", "ERROR")
             return False
         except asyncio.TimeoutError:
             logger.warning(f"streamrip timed out at quality {q}")
