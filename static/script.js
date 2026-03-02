@@ -51,6 +51,9 @@
 // ── State ────────────────────────────────
 let ws=null,wsStatus={},stagingTracks=[];
 let currentPath='',sortBy='name',sortDir=1,autoScroll=true;
+let selectedFiles = new Set();
+let isMultiSelectMode = false;
+let longPressTimer = null;
 
 // ── WebSocket ────────────────────────────
 function connectWS(){
@@ -73,8 +76,46 @@ function connectWS(){
 
 function updateUI(s){
   const q=s.queue||[],a=s.active||[],c=s.completed||[],f=s.failed||[];
-  animNum('stat-queue',q.length);animNum('stat-active',a.length);
-  animNum('stat-done',c.length);animNum('stat-fail',f.length);
+  
+  // Update Dashboard Session Stats
+  document.getElementById('dash-done').textContent = c.length;
+  document.getElementById('dash-fail').textContent = f.length;
+  document.getElementById('dash-queue').textContent = q.length;
+  
+  // Update Dashboard System Status
+  const statusTitle = document.getElementById('dash-status-title');
+  const statusDetail = document.getElementById('dash-status-detail');
+  const statusSub = document.getElementById('dash-status-sub');
+  const statusCover = document.getElementById('dash-status-cover');
+
+  if(a.length > 0){
+      const current = a[0];
+      statusTitle.textContent = 'DOWNLOADING';
+      statusTitle.style.color = 'var(--gold)';
+      statusDetail.textContent = `${current.artist} - ${current.title}`;
+      statusSub.textContent = q.length > 0 ? `${q.length} more in queue` : 'Processing last item';
+      if(statusCover) {
+          statusCover.src = current.cover || `/api/track-cover?artist=${enc(current.artist)}&title=${enc(current.title)}`;
+          statusCover.style.display = 'block';
+      }
+  } else if(q.length > 0) {
+      const first = q[0];
+      statusTitle.textContent = 'QUEUED';
+      statusTitle.style.color = 'var(--cyan)';
+      statusDetail.textContent = `${first.artist} - ${first.title}`;
+      statusSub.textContent = `${q.length} tracks waiting`;
+      if(statusCover) {
+          statusCover.src = first.cover || `/api/track-cover?artist=${enc(first.artist)}&title=${enc(first.title)}`;
+          statusCover.style.display = 'block';
+      }
+  } else {
+      statusTitle.textContent = 'IDLE';
+      statusTitle.style.color = 'var(--muted)';
+      statusDetail.textContent = 'Standing by for input';
+      statusSub.textContent = 'System ready';
+      if(statusCover) statusCover.style.display = 'none';
+  }
+
   const total=q.length+a.length;
   const badge=document.getElementById('queue-badge');
   badge.textContent=total;badge.classList.toggle('hidden',total===0);
@@ -92,14 +133,19 @@ function updateUI(s){
   ql.innerHTML=all.map((item,idx)=>{
     const status=item.status||(item._cat==='done'?'completed':item._cat==='fail'?'failed':'pending');
     const prog=status==='downloading'?`<div class="q-progress"><div class="q-progress-bar"></div></div>`:'';
-    const isRemovable = ['pending','downloading'].includes(status);
-    const stopBtn = isRemovable ? `<button class="q-stop-btn" onclick="removeFromQueue('${item.id}')" title="Remove from queue">✕</button>` : '';
+    
+    let actionBtn = '';
+    if(['pending','downloading'].includes(status)){
+        actionBtn = `<button class="q-stop-btn" onclick="removeFromQueue('${item.id}')" title="Remove from queue">✕</button>`;
+    } else if(status === 'failed'){
+        actionBtn = `<button class="q-retry-btn" onclick="retryTrack('${item.id}')" title="Retry download">↻</button>`;
+    }
 
     return `<div class="queue-item ${status}" style="animation-delay:${idx*.04}s">
       <img class="q-cover" src="/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}" onerror="this.src='/api/track-cover'" loading="lazy"/>
       <div class="q-info"><div class="q-title">${esc(item.title)}</div><div class="q-artist">${esc(item.artist||'—')}</div>${prog}</div>
       <span class="q-status ${status}">${status}</span>
-      ${stopBtn}
+      ${actionBtn}
     </div>`;
   }).join('');
   updateLogs(s.logs||[]);
@@ -128,12 +174,16 @@ function animNum(id,v){
 
 function updateLogs(logs){
   const c=document.getElementById('log-container');
+  if(!c) return;
+  const isVisible = c.offsetParent !== null;
+  
   c.innerHTML=logs.map(l=>{
     const d=new Date(l.ts*1000);
     const ts=d.toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
     return `<div class="log-line"><span class="ts">${ts}</span><span class="level ${l.level}">${l.level}</span><span class="msg">${esc(l.msg)}</span></div>`;
   }).join('');
-  if(autoScroll)c.scrollTop=c.scrollHeight;
+  
+  if(autoScroll && isVisible) c.scrollTop=c.scrollHeight;
 }
 
 // ── Search ───────────────────────────────
@@ -179,7 +229,7 @@ function renderHistory(){
     }
     list.innerHTML = history.map((h, i) => {
         let label = typeof h.value === 'string' ? h.value : `${h.value.artist} - ${h.value.title}`;
-        let icon = h.type === 'search' ? '🔍' : (h.type === 'playlist' ? '📋' : '✏️');
+        let icon = h.type === 'search' ? '🔍' : (h.type === 'playlist' ? '📋' : (h.type === 'manual' ? '✏️' : '🎵'));
         return `<div class="history-item" onclick="applyHistory(${i})">
             <span class="history-icon">${icon}</span>
             <span class="history-val">${esc(label)}</span>
@@ -191,7 +241,7 @@ function applyHistory(index){
     const history = JSON.parse(localStorage.getItem('mv-history') || '[]');
     const item = history[index];
     if(!item) return;
-    if(item.type === 'manual'){
+    if(item.type === 'manual' || item.type === 'track'){
         addToStaging(item.value);
     } else {
         sInput.value = item.value;
@@ -349,8 +399,22 @@ function addToStaging(track){
   if(stagingTracks.find(t=>t.title===track.title&&t.artist===track.artist)){toast('Already staged','info');return;}
   stagingTracks.push(track);renderStaging();
   sugEl.classList.add('hidden');
+  saveToHistory('track', track);
   toast(`Staged: ${track.title}`,'success');
 }
+
+async function retryTrack(id){
+    try{
+        const r = await fetch('/api/download/retry', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({id})
+        });
+        const data = await r.json();
+        if(data.ok) toast('Retrying track...', 'info');
+    } catch(e) { toast('Failed to retry track', 'error'); }
+}
+
 function renderStaging(){
   const el=document.getElementById('staging');
   const cnt=document.getElementById('staging-count');
@@ -389,23 +453,85 @@ document.getElementById('stop-queue-btn').addEventListener('click',async()=>{
   await fetch('/api/download/stop',{method:'POST',headers:{'Content-Type':'application/json'}});
   toast('Queue and active downloads stopped','info');
 });
+document.getElementById('retry-failed-btn').addEventListener('click',async()=>{
+    // We can either add a new endpoint for 'retry-all' or just call retry for each
+    const failedItems = wsStatus.failed || [];
+    if(!failedItems.length) { toast('No failed tracks to retry', 'info'); return; }
+    for(const item of failedItems){
+        await fetch('/api/download/retry', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({id: item.id})
+        });
+    }
+    toast(`Retrying ${failedItems.length} tracks`, 'info');
+});
 
 // ── Files ────────────────────────────────
 async function loadFiles(path=currentPath){
   currentPath=path;updateBreadcrumb(path);
+  clearSelection();
   try{
     const r=await fetch(`/api/files?path=${enc(path)}`);
     const data=await r.json();
-    if(data.disk)updateDisk(data.disk);
+    if(data.disk)updateDashboardDisk(data.disk);
     renderFiles(data.items||[]);
   }catch{toast('Failed to load files','error');}
 }
-function updateDisk(disk){
+function updateDashboardDisk(disk){
   const pct=Math.round((disk.used/disk.total)*100);
-  document.getElementById('disk-fill').style.width=`${pct}%`;
-  document.getElementById('disk-fill').style.background=pct>90?'var(--rose)':pct>70?'var(--amber)':'linear-gradient(90deg,var(--cyan),var(--gold))';
-  document.getElementById('disk-info').textContent=`${fmtBytes(disk.used)} / ${fmtBytes(disk.total)} (${pct}%)`;
+  const fill = document.getElementById('dash-storage-fill');
+  const pctText = document.getElementById('dash-storage-pct');
+  const subText = document.getElementById('dash-storage-text');
+  
+  if(fill) fill.style.width=`${pct}%`;
+  if(pctText) pctText.textContent = `${pct}%`;
+  if(subText) subText.textContent = `${fmtBytes(disk.used)} / ${fmtBytes(disk.total)}`;
+  
+  if(fill){
+      fill.style.background=pct>90?'var(--rose)':pct>70?'var(--amber)':'linear-gradient(90deg,var(--cyan),var(--gold))';
+  }
+  
+  // Also update the old library disk meter if it still exists
+  const oldFill = document.getElementById('disk-fill');
+  if(oldFill){
+      oldFill.style.width=`${pct}%`;
+      const dpInfo = document.getElementById('disk-info');
+      if(dpInfo) dpInfo.textContent=`${fmtBytes(disk.used)} / ${fmtBytes(disk.total)} (${pct}%)`;
+  }
 }
+
+function clearSelection(){
+    selectedFiles.clear();
+    isMultiSelectMode = false;
+    updateBatchToolbar();
+    document.querySelectorAll('.file-card.selected').forEach(el => el.classList.remove('selected'));
+}
+
+function updateBatchToolbar(){
+    const tb = document.getElementById('batch-toolbar');
+    const count = document.getElementById('batch-count');
+    if(selectedFiles.size > 0){
+        tb.classList.remove('hidden');
+        count.textContent = `${selectedFiles.size} item${selectedFiles.size !== 1 ? 's' : ''} selected`;
+    } else {
+        tb.classList.add('hidden');
+        isMultiSelectMode = false;
+    }
+}
+
+function toggleFileSelection(path, cardEl){
+    if(selectedFiles.has(path)){
+        selectedFiles.delete(path);
+        cardEl.classList.remove('selected');
+    } else {
+        selectedFiles.add(path);
+        cardEl.classList.add('selected');
+    }
+    isMultiSelectMode = selectedFiles.size > 0;
+    updateBatchToolbar();
+}
+
 function renderFiles(items){
   const filter=document.getElementById('fm-search').value.toLowerCase();
   let filtered=items.filter(f=>f.name.toLowerCase().includes(filter));
@@ -421,11 +547,50 @@ function renderFiles(items){
     const isAudio=['.mp3','.flac','.m4a','.wav','.ogg','.opus'].includes(f.ext);
     const actions=f.type==='dir'?`<div class="file-actions"><button class="fa-btn fa-zip" title="Zip" onclick="zipFolder('${esc(f.path)}',event)">🗜</button><button class="fa-btn fa-del" title="Delete" onclick="deleteFile('${esc(f.path)}',event)">🗑</button></div>`
       :`<div class="file-actions">${isAudio?`<button class="fa-btn fa-play" title="Play" onclick="playFile('${esc(f.path)}','${esc(f.name)}',event)">▶</button>`:''}<button class="fa-btn fa-dl" title="Download" onclick="downloadFile('${esc(f.path)}',event)">⬇</button><button class="fa-btn fa-rename" title="Rename" onclick="renameFile('${esc(f.path)}','${esc(f.name)}',event)">✏</button><button class="fa-btn fa-del" title="Delete" onclick="deleteFile('${esc(f.path)}',event)">🗑</button></div>`;
-    return `<div class="file-card" style="animation-delay:${idx*.03}s" onclick="fileClick('${esc(f.path)}','${esc(f.type)}')">
+    
+    const isSelected = selectedFiles.has(f.path);
+    return `<div class="file-card ${isSelected ? 'selected' : ''}" style="animation-delay:${idx*.03}s" 
+                 onmousedown="onFileMouseDown('${esc(f.path)}', event)"
+                 onmouseup="onFileMouseUp('${esc(f.path)}', '${esc(f.type)}', event)"
+                 onmouseleave="onFileMouseLeave()"
+                 ontouchstart="onFileMouseDown('${esc(f.path)}', event)"
+                 ontouchend="onFileMouseUp('${esc(f.path)}', '${esc(f.type)}', event)">
       <div class="file-icon">${icon}</div><div class="file-name" title="${esc(f.name)}">${esc(f.name)}</div>
       <div class="file-meta">${f.type==='dir'?'folder':fmtBytes(f.size)}</div>${actions}</div>`;
   }).join('');
 }
+
+function onFileMouseDown(path, e){
+    if(e.button !== 0 && e.type !== 'touchstart') return;
+    longPressTimer = setTimeout(() => {
+        isMultiSelectMode = true;
+        const card = e.target.closest('.file-card');
+        toggleFileSelection(path, card);
+        if(window.navigator.vibrate) window.navigator.vibrate(50);
+        longPressTimer = null;
+    }, 600);
+}
+
+function onFileMouseUp(path, type, e){
+    if(longPressTimer){
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+        if(isMultiSelectMode){
+            const card = e.target.closest('.file-card');
+            toggleFileSelection(path, card);
+        } else {
+            fileClick(path, type);
+        }
+    }
+}
+
+function onFileMouseLeave(){
+    if(longPressTimer){
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+    }
+}
+
 function fileClick(path,type){if(type==='dir')loadFiles(path);}
 function updateBreadcrumb(path){
   const el=document.getElementById('breadcrumb');
@@ -529,6 +694,17 @@ async function loadConfig(){
   const r=await fetch('/api/config');const cfg=await r.json();
   document.getElementById('cfg-arl').value=cfg.arl||'';
   document.getElementById('cfg-quality').value=cfg.quality||'MP3_320';
+  
+  if(cfg.deps){
+      const sr = document.getElementById('dep-streamrip');
+      const yt = document.getElementById('dep-ytdlp');
+      if(sr) sr.innerHTML = `streamrip: <span style="color:${cfg.deps.streamrip ? 'var(--emerald)' : 'var(--rose)'}">${cfg.deps.streamrip ? 'INSTALLED' : 'MISSING'}</span>`;
+      if(yt) yt.innerHTML = `yt-dlp: <span style="color:${cfg.deps.ytdlp ? 'var(--emerald)' : 'var(--rose)'}">${cfg.deps.ytdlp ? 'INSTALLED' : 'MISSING'}</span>`;
+  }
+  if(cfg.download_path){
+      const dp = document.getElementById('cfg-dl-path');
+      if(dp) dp.textContent = cfg.download_path;
+  }
 }
 document.getElementById('save-config-btn').addEventListener('click',async()=>{
   const arl=document.getElementById('cfg-arl').value.trim();
@@ -545,6 +721,10 @@ function showTab(name){
   document.querySelector(`[data-tab="${name}"]`).classList.add('active');
   if(name==='files')loadFiles();
   if(name==='config')loadConfig();
+  if(name==='logs'){
+      const c = document.getElementById('log-container');
+      if(c && autoScroll) c.scrollTop = c.scrollHeight;
+  }
 }
 document.querySelectorAll('.nav-item').forEach(item=>item.addEventListener('click',()=>showTab(item.dataset.tab)));
 
@@ -581,4 +761,49 @@ function getFileIcon(ext){
 }
 
 // ── Init ──────────────────────────────────
-connectWS();loadConfig();
+connectWS();loadConfig();loadFiles('');
+
+document.getElementById('batch-cancel').addEventListener('click', clearSelection);
+
+document.getElementById('batch-delete').addEventListener('click', async () => {
+    if(selectedFiles.size === 0) return;
+    if(!confirm(`Delete ${selectedFiles.size} selected items?`)) return;
+    
+    toast(`Deleting ${selectedFiles.size} items...`, 'info');
+    const items = Array.from(selectedFiles);
+    for(const path of items){
+        await fetch('/api/files/delete', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path})
+        });
+    }
+    toast('Batch delete complete', 'success');
+    loadFiles();
+});
+
+document.getElementById('batch-zip').addEventListener('click', async () => {
+    if(selectedFiles.size === 0) return;
+    toast('Creating batch zip...', 'info');
+    
+    try {
+        const r = await fetch('/api/files/zip/batch', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({paths: Array.from(selectedFiles)})
+        });
+        const data = await r.json();
+        if(data.ok){
+            toast('Batch zip ready!', 'success');
+            const a = document.createElement('a');
+            a.href = `/files/${data.zip_path}`;
+            a.download = data.zip_path.split('/').pop();
+            a.click();
+            clearSelection();
+        } else {
+            toast('Batch zip failed', 'error');
+        }
+    } catch(e) {
+        toast('Error creating batch zip', 'error');
+    }
+});

@@ -363,7 +363,7 @@ async def process_download(item: dict):
     
     # Determine output directory
     if item.get("type") == "playlist":
-        playlist_name = item.get("playlist_name", "Unknown Playlist")
+        playlist_name = str(item.get("playlist_name") or "Unknown Playlist")
         out_dir = PLAYLISTS_DIR / sanitize_filename(playlist_name) / sanitize_filename(f"{artist} - {title}" if artist else title)
     else:
         out_dir = SINGLES_DIR / sanitize_filename(f"{artist} - {title}" if artist else title)
@@ -685,6 +685,35 @@ async def stop_downloads(request):
     return web.json_response({"ok": True})
 
 
+async def retry_track(request):
+    try:
+        body = await request.json()
+        tid = body.get("id")
+        if not tid:
+            return web.json_response({"error": "No ID provided"}, status=400)
+        
+        async with DOWNLOAD_LOCK:
+            # Find in failed
+            failed_item = next((x for x in DOWNLOAD_STATUS["failed"] if x["id"] == tid), None)
+            if failed_item:
+                # Remove from failed
+                DOWNLOAD_STATUS["failed"] = [x for x in DOWNLOAD_STATUS["failed"] if x["id"] != tid]
+                # Prepare for retry
+                failed_item["status"] = "pending"
+                failed_item["queued_at"] = time.time()
+                # Clean up old timestamps
+                failed_item.pop("finished_at", None)
+                failed_item.pop("started_at", None)
+                # Add back to queue
+                DOWNLOAD_STATUS["queue"].append(failed_item)
+                save_status()
+                
+        await broadcast()
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def track_cover(request):
     artist = request.rel_url.query.get("artist", "")
     title = request.rel_url.query.get("title", "")
@@ -796,6 +825,35 @@ async def zip_folder(request):
     return web.json_response({"ok": True, "zip_path": rel_zip})
 
 
+async def zip_files_batch(request):
+    try:
+        body = await request.json()
+        paths = body.get("paths", [])
+        if not paths:
+            return web.json_response({"error": "no paths provided"}, status=400)
+            
+        zip_name = f"batch_export_{int(time.time())}.zip"
+        zip_path = DOWNLOADS_DIR / zip_name
+        
+        def create_batch_zip():
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for p in paths:
+                    target = (DOWNLOADS_DIR / p).resolve()
+                    if not str(target).startswith(str(DOWNLOADS_DIR)) or not target.exists():
+                        continue
+                    if target.is_dir():
+                        for f in target.rglob("*"):
+                            if f.is_file():
+                                zf.write(f, f.relative_to(target.parent))
+                    else:
+                        zf.write(target, target.name)
+                        
+        await asyncio.to_thread(create_batch_zip)
+        return web.json_response({"ok": True, "zip_path": zip_name})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
 async def serve_file(request):
     rel = request.match_info.get("path", "")
     target = (DOWNLOADS_DIR / rel).resolve()
@@ -824,7 +882,7 @@ quality = "{quality}"
 
 
 async def get_config(request):
-    cfg = {"arl": "", "quality": "MP3_320"}
+    cfg = {"arl": "", "quality": "MP3_320", "deps": {}}
     if CONFIG_FILE.exists():
         content = CONFIG_FILE.read_text()
         m = re.search(r'arl\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', content)
@@ -833,6 +891,12 @@ async def get_config(request):
         m = re.search(r'quality\s*=\s*"([^"]*)"', content)
         if m:
             cfg["quality"] = m.group(1)
+            
+    # Check dependencies
+    cfg["deps"]["streamrip"] = shutil.which("rip") is not None
+    cfg["deps"]["ytdlp"] = shutil.which("yt-dlp") is not None
+    cfg["download_path"] = str(DOWNLOADS_DIR)
+    
     return web.json_response(cfg)
 
 
@@ -865,12 +929,14 @@ def create_app():
     app.router.add_post("/api/download/playlist", download_playlist)
     app.router.add_post("/api/download/clear", clear_queue)
     app.router.add_post("/api/download/stop", stop_downloads)
+    app.router.add_post("/api/download/retry", retry_track)
     app.router.add_post("/api/download/remove", remove_from_queue)
     app.router.add_get("/api/track-cover", track_cover)
     app.router.add_get("/api/files", list_files)
     app.router.add_post("/api/files/rename", rename_file)
     app.router.add_post("/api/files/delete", delete_file)
     app.router.add_post("/api/files/zip", zip_folder)
+    app.router.add_post("/api/files/zip/batch", zip_files_batch)
     app.router.add_get("/api/status", get_status)
     app.router.add_get("/api/config", get_config)
     app.router.add_post("/api/config", save_config)
