@@ -92,13 +92,29 @@ function updateUI(s){
   ql.innerHTML=all.map((item,idx)=>{
     const status=item.status||(item._cat==='done'?'completed':item._cat==='fail'?'failed':'pending');
     const prog=status==='downloading'?`<div class="q-progress"><div class="q-progress-bar"></div></div>`:'';
+    const isRemovable = ['pending','downloading'].includes(status);
+    const stopBtn = isRemovable ? `<button class="q-stop-btn" onclick="removeFromQueue('${item.id}')" title="Remove from queue">✕</button>` : '';
+
     return `<div class="queue-item ${status}" style="animation-delay:${idx*.04}s">
       <img class="q-cover" src="/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}" onerror="this.src='/api/track-cover'" loading="lazy"/>
       <div class="q-info"><div class="q-title">${esc(item.title)}</div><div class="q-artist">${esc(item.artist||'—')}</div>${prog}</div>
       <span class="q-status ${status}">${status}</span>
+      ${stopBtn}
     </div>`;
   }).join('');
   updateLogs(s.logs||[]);
+}
+
+async function removeFromQueue(id){
+  try{
+    const r=await fetch('/api/download/remove',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({id})
+    });
+    const data=await r.json();
+    if(data.ok) toast('Removed from queue','info');
+  }catch(e){ toast('Failed to remove track','error'); }
 }
 
 function animNum(id,v){
@@ -122,28 +138,158 @@ function updateLogs(logs){
 
 // ── Search ───────────────────────────────
 let sTimeout;
-const sInput=document.getElementById('deezer-q');
+const sInput=document.getElementById('search-q');
 const sugEl=document.getElementById('suggestions');
+const statusEl=document.getElementById('search-status');
+const histEl=document.getElementById('history-panel');
+
+function toggleHistory(show){
+    if(show===undefined) histEl.classList.toggle('hidden');
+    else if(show) histEl.classList.remove('hidden');
+    else histEl.classList.add('hidden');
+    if(!histEl.classList.contains('hidden')) renderHistory();
+}
+
+document.getElementById('history-toggle-btn').addEventListener('click',(e)=>{
+    e.stopPropagation();
+    toggleHistory();
+});
+
+document.addEventListener('click',e=>{
+    if(!e.target.closest('#search-area')){
+        sugEl.classList.add('hidden');
+        toggleHistory(false);
+    }
+});
+
+function saveToHistory(type, value){
+    let history = JSON.parse(localStorage.getItem('mv-history') || '[]');
+    // Avoid duplicates of the same value
+    history = history.filter(h => JSON.stringify(h.value) !== JSON.stringify(value));
+    history.unshift({ type, value, ts: Date.now() });
+    localStorage.setItem('mv-history', JSON.stringify(history.slice(0, 30))); // Keep 30 items
+}
+
+function renderHistory(){
+    const list = document.getElementById('history-list');
+    const history = JSON.parse(localStorage.getItem('mv-history') || '[]');
+    if(!history.length){
+        list.innerHTML = `<div style="padding:10px;color:var(--dim);font-size:11px;font-family:'JetBrains Mono',monospace">No recent activity</div>`;
+        return;
+    }
+    list.innerHTML = history.map((h, i) => {
+        let label = typeof h.value === 'string' ? h.value : `${h.value.artist} - ${h.value.title}`;
+        let icon = h.type === 'search' ? '🔍' : (h.type === 'playlist' ? '📋' : '✏️');
+        return `<div class="history-item" onclick="applyHistory(${i})">
+            <span class="history-icon">${icon}</span>
+            <span class="history-val">${esc(label)}</span>
+        </div>`;
+    }).join('');
+}
+
+function applyHistory(index){
+    const history = JSON.parse(localStorage.getItem('mv-history') || '[]');
+    const item = history[index];
+    if(!item) return;
+    if(item.type === 'manual'){
+        addToStaging(item.value);
+    } else {
+        sInput.value = item.value;
+        handleSearchSubmit();
+    }
+    toggleHistory(false);
+}
+
+document.getElementById('clear-history-btn').addEventListener('click', (e)=>{
+    e.stopPropagation();
+    localStorage.removeItem('mv-history');
+    renderHistory();
+});
+
 sInput.addEventListener('input',()=>{
   clearTimeout(sTimeout);
   const q=sInput.value.trim();
+  statusEl.textContent = '';
   if(!q||q.length<2){sugEl.classList.add('hidden');return;}
+  
+  // If it looks like a URL, don't show Deezer suggestions
+  if(q.startsWith('http')){
+      sugEl.classList.add('hidden');
+      statusEl.textContent = 'Playlist URL detected. Press Enter or click ⌕ to fetch.';
+      return;
+  }
+  
   sTimeout=setTimeout(()=>doSearch(q),320);
 });
+
 sInput.addEventListener('keydown',e=>{
-  if(e.key==='Enter')doSearch(sInput.value.trim());
-  if(e.key==='Escape')sugEl.classList.add('hidden');
+  if(e.key==='Enter') handleSearchSubmit();
+  if(e.key==='Escape') {
+      sugEl.classList.add('hidden');
+      toggleHistory(false);
+  }
 });
-document.getElementById('search-submit').addEventListener('click',()=>doSearch(sInput.value.trim()));
-document.addEventListener('click',e=>{if(!e.target.closest('#deezer-search-area'))sugEl.classList.add('hidden');});
+
+document.getElementById('search-submit').addEventListener('click',handleSearchSubmit);
+
+function handleSearchSubmit(){
+    const q=sInput.value.trim();
+    if(!q) return;
+    if(q.startsWith('http')){
+        saveToHistory('playlist', q);
+        doPlaylistSearch(q);
+    } else {
+        saveToHistory('search', q);
+        doSearch(q);
+    }
+    toggleHistory(false);
+}
+
+document.addEventListener('click',e=>{if(!e.target.closest('#search-area'))sugEl.classList.add('hidden');});
 
 async function doSearch(q){
-  if(!q)return;
+  if(!q || q.startsWith('http'))return;
   try{
     const r=await fetch(`/api/search/suggestions?q=${enc(q)}`);
     renderSug(await r.json());
   }catch{toast('Search failed','error');}
 }
+
+async function doPlaylistSearch(url){
+    statusEl.textContent='Fetching playlist metadata...';
+    try{
+        const r=await fetch('/api/search/playlist',{
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({url})
+        });
+        const data=await r.json();
+        if(data.error){
+            statusEl.textContent=`Error: ${data.error}`;
+            toast(data.error,'error');
+        }else{
+            const tracks=data.tracks||[];
+            const playlistTitle = data.title || 'Unknown Playlist';
+            statusEl.textContent=`Found ${tracks.length} tracks in "${playlistTitle}". Staging…`;
+            let added=0;
+            tracks.forEach(t=>{
+                if(!stagingTracks.find(st=>st.title===t.title&&st.artist===t.artist)){
+                    t.playlist_name = playlistTitle;
+                    stagingTracks.push(t);
+                    added++;
+                }
+            });
+            renderStaging();
+            statusEl.textContent=`Added ${added} new tracks from "${playlistTitle}" to staging.`;
+            toast(`Added ${added} tracks`,'success');
+            sInput.value='';
+        }
+    }catch(e){
+        statusEl.textContent='Failed to fetch playlist';
+        toast('Fetch failed','error');
+    }
+}
+
 function renderSug(tracks){
   if(!tracks.length){
     sugEl.innerHTML=`<div style="padding:20px;color:var(--dim);text-align:center;font-size:12px;font-family:'JetBrains Mono',monospace">No results found</div>`;
@@ -166,23 +312,35 @@ function renderSug(tracks){
 }
 
 // ── Mode toggle ──────────────────────────
-document.getElementById('mode-deezer').addEventListener('click',()=>{
-  document.getElementById('mode-deezer').classList.add('active');
-  document.getElementById('mode-manual').classList.remove('active');
-  document.getElementById('deezer-search-area').classList.remove('hidden');
-  document.getElementById('manual-area').classList.add('hidden');
+document.getElementById('mode-search').addEventListener('click',()=>{
+  setActiveMode('search');
 });
 document.getElementById('mode-manual').addEventListener('click',()=>{
-  document.getElementById('mode-manual').classList.add('active');
-  document.getElementById('mode-deezer').classList.remove('active');
-  document.getElementById('deezer-search-area').classList.add('hidden');
-  document.getElementById('manual-area').classList.remove('hidden');
+  setActiveMode('manual');
 });
+
+function setActiveMode(mode){
+  ['search','manual'].forEach(m=>{
+    const btn=document.getElementById(`mode-${m}`);
+    const area=document.getElementById(`${m}-area`);
+    if(btn){
+        if(m===mode) btn.classList.add('active');
+        else btn.classList.remove('active');
+    }
+    if(area){
+        if(m===mode) area.classList.remove('hidden');
+        else area.classList.add('hidden');
+    }
+  });
+}
+
 document.getElementById('add-manual').addEventListener('click',()=>{
   const artist=document.getElementById('m-artist').value.trim();
   const title=document.getElementById('m-title').value.trim();
   if(!title){toast('Please enter a title','error');return;}
-  addToStaging({title,artist,cover:''});
+  const track = {title,artist,cover:''};
+  addToStaging(track);
+  saveToHistory('manual', track);
   document.getElementById('m-artist').value='';document.getElementById('m-title').value='';
 });
 
@@ -211,7 +369,13 @@ document.getElementById('sync-all').addEventListener('click',async()=>{
   if(!stagingTracks.length){toast('Nothing staged!','error');return;}
   try{
     const r=await fetch('/api/download/playlist',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({tracks:stagingTracks.map(t=>({title:t.title,artist:t.artist,deezer_id:t.id,cover:t.cover}))})});
+      body:JSON.stringify({tracks:stagingTracks.map(t=>({
+          title:t.title,
+          artist:t.artist,
+          deezer_id:t.id,
+          cover:t.cover,
+          playlist_name:t.playlist_name
+      }))})});
     const data=await r.json();
     toast(`Queued ${data.count} tracks ⚡`,'success');
     stagingTracks=[];renderStaging();
@@ -220,6 +384,10 @@ document.getElementById('sync-all').addEventListener('click',async()=>{
 document.getElementById('clear-queue-btn').addEventListener('click',async()=>{
   await fetch('/api/download/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})});
   toast('Queue cleared','info');
+});
+document.getElementById('stop-queue-btn').addEventListener('click',async()=>{
+  await fetch('/api/download/stop',{method:'POST',headers:{'Content-Type':'application/json'}});
+  toast('Queue and active downloads stopped','info');
 });
 
 // ── Files ────────────────────────────────

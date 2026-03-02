@@ -360,7 +360,14 @@ async def process_download(item: dict):
     artist = item.get("artist", "")
     title = item.get("title", "")
     deezer_id = item.get("deezer_id")
-    out_dir = SINGLES_DIR / sanitize_filename(f"{artist} - {title}" if artist else title)
+    
+    # Determine output directory
+    if item.get("type") == "playlist":
+        playlist_name = item.get("playlist_name", "Unknown Playlist")
+        out_dir = PLAYLISTS_DIR / sanitize_filename(playlist_name) / sanitize_filename(f"{artist} - {title}" if artist else title)
+    else:
+        out_dir = SINGLES_DIR / sanitize_filename(f"{artist} - {title}" if artist else title)
+        
     out_dir.mkdir(parents=True, exist_ok=True)
 
     add_log(f"Starting download: {artist} - {title}")
@@ -378,9 +385,24 @@ async def process_download(item: dict):
     method = "unknown"
 
     # Step 1: Try streamrip (Deezer)
-    if deezer_id:
+    # Ensure we have a valid numeric Deezer ID. Spotify IDs are alphanumeric strings.
+    is_valid_deezer_id = str(deezer_id).isdigit() if deezer_id else False
+
+    if not is_valid_deezer_id:
+        # Try to find a real Deezer ID if we only have title/artist or a non-numeric ID
+        search_query = f"{artist} {title}"
+        add_log(f"Searching Deezer ID for: {search_query}")
+        search_results = deezer_search(search_query, limit=1)
+        if search_results:
+            deezer_id = search_results[0].get("id")
+            add_log(f"Found Deezer ID: {deezer_id}")
+            is_valid_deezer_id = True
+        else:
+            add_log(f"No Deezer ID found for {search_query}", "WARNING")
+
+    if is_valid_deezer_id and deezer_id:
         add_log(f"Trying Deezer (streamrip) for track {deezer_id}")
-        success = await run_streamrip(deezer_id, out_dir)
+        success = await run_streamrip(str(deezer_id), out_dir)
         if success:
             method = "deezer"
             add_log(f"✓ Deezer download succeeded: {title}")
@@ -446,6 +468,124 @@ async def search_suggestions(request):
     return web.json_response(results)
 
 
+async def search_playlist(request):
+    try:
+        body = await request.json()
+        url = body.get("url", "")
+        if not url:
+            return web.json_response({"error": "No URL provided"}, status=400)
+
+        # Handle Spotify specifically
+        if "spotify.com" in url and "playlist" in url:
+            return await handle_spotify_playlist(url)
+
+        # For YouTube and others, get playlist title first
+        title_cmd = ["yt-dlp", "--flat-playlist", "--print", "%(playlist_title)s", "--playlist-items", "1", url]
+        playlist_title = "Unknown Playlist"
+        try:
+            proc = await asyncio.create_subprocess_exec(*title_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            if proc.returncode == 0:
+                playlist_title = stdout.decode().strip() or "Unknown YouTube Playlist"
+        except: pass
+
+        cmd = [
+            "yt-dlp",
+            "--flat-playlist",
+            "--dump-json",
+            "--quiet",
+            url
+        ]
+        
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+        
+        if proc.returncode != 0:
+            err = stderr.decode().strip()
+            logger.error(f"yt-dlp playlist error: {err}")
+            return web.json_response({"error": f"Failed to fetch playlist: {err[:100]}"}, status=500)
+
+        tracks = []
+        for line in stdout.decode().splitlines():
+            if not line: continue
+            try:
+                data = json.loads(line)
+                title = data.get("title", "Unknown")
+                artist = data.get("artist") or data.get("uploader") or data.get("channel", "Unknown Artist")
+                
+                # If title looks like "Artist - Song", split it
+                if " - " in title and (not data.get("artist") or data.get("artist") == "Unknown Artist"):
+                    parts = title.split(" - ", 1)
+                    artist = parts[0].strip()
+                    title = parts[1].strip()
+
+                tracks.append({
+                    "title": title,
+                    "artist": artist,
+                    "album": data.get("album", ""),
+                    "duration": data.get("duration", 0),
+                    "cover": data.get("thumbnail", ""),
+                    "id": data.get("id")
+                })
+            except: continue
+            
+        return web.json_response({"tracks": tracks, "title": playlist_title})
+    except Exception as e:
+        logger.exception("Playlist search failed")
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def handle_spotify_playlist(url):
+    try:
+        playlist_id = re.search(r'playlist/([a-zA-Z0-9]+)', url).group(1)
+        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+        
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(embed_url) as resp:
+                if resp.status != 200:
+                    return web.json_response({"error": f"Spotify returned status {resp.status}"}, status=resp.status)
+                html = await resp.text()
+                
+        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">([^<]+)</script>', html)
+        if not match:
+            return web.json_response({"error": "Failed to parse Spotify metadata"}, status=500)
+            
+        data = json.loads(match.group(1))
+        entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})
+        track_list = entity.get('trackList', [])
+        playlist_name = entity.get('name', 'Unknown Spotify Playlist')
+        
+        # Get playlist cover
+        playlist_cover = ""
+        sources = entity.get('coverArt', {}).get('sources', [])
+        if sources:
+            playlist_cover = sources[0].get('url', '')
+        
+        tracks = []
+        for t in track_list:
+            c_sources = t.get("coverArt", {}).get("sources", [])
+            t_cover = c_sources[0].get("url", playlist_cover) if c_sources else playlist_cover
+            
+            tracks.append({
+                "title": t.get("title", "Unknown"),
+                "artist": t.get("subtitle", "Unknown Artist"),
+                "album": "",
+                "duration": t.get("duration", 0) / 1000,
+                "cover": t_cover,
+                "id": t.get("uri", "").split(":")[-1]
+            })
+            
+        return web.json_response({"tracks": tracks, "title": playlist_name})
+    except Exception as e:
+        logger.exception("Spotify playlist handling failed")
+        return web.json_response({"error": f"Spotify error: {str(e)}"}, status=500)
+
+
 async def download_single(request):
     body = await request.json()
     item = {
@@ -478,6 +618,7 @@ async def download_playlist(request):
                 "artist": t.get("artist", ""),
                 "deezer_id": t.get("deezer_id"),
                 "cover": t.get("cover", ""),
+                "playlist_name": t.get("playlist_name"),
                 "status": "pending",
                 "queued_at": time.time(),
                 "type": "playlist",
@@ -501,6 +642,44 @@ async def clear_queue(request):
         if clear_all:
             DOWNLOAD_STATUS["completed"] = []
             DOWNLOAD_STATUS["failed"] = []
+        save_status()
+    await broadcast()
+    return web.json_response({"ok": True})
+
+
+async def remove_from_queue(request):
+    try:
+        body = await request.json()
+        tid = body.get("id")
+        if not tid:
+            return web.json_response({"error": "No ID provided"}, status=400)
+        
+        async with DOWNLOAD_LOCK:
+            # Check queue
+            original_len = len(DOWNLOAD_STATUS["queue"])
+            DOWNLOAD_STATUS["queue"] = [x for x in DOWNLOAD_STATUS["queue"] if x["id"] != tid]
+            removed = len(DOWNLOAD_STATUS["queue"]) < original_len
+            
+            # Note: Removing from "active" is trickier as a process is running. 
+            # For now we'll just remove it from the list so it doesn't show in UI.
+            # Real cancellation would require tracking task objects.
+            original_active_len = len(DOWNLOAD_STATUS["active"])
+            DOWNLOAD_STATUS["active"] = [x for x in DOWNLOAD_STATUS["active"] if x["id"] != tid]
+            removed = removed or (len(DOWNLOAD_STATUS["active"]) < original_active_len)
+            
+            if removed:
+                save_status()
+                
+        await broadcast()
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def stop_downloads(request):
+    async with DOWNLOAD_LOCK:
+        DOWNLOAD_STATUS["queue"] = []
+        DOWNLOAD_STATUS["active"] = []
         save_status()
     await broadcast()
     return web.json_response({"ok": True})
@@ -681,9 +860,12 @@ def create_app():
     # Routes
     app.router.add_get("/ws/status", ws_handler)
     app.router.add_get("/api/search/suggestions", search_suggestions)
+    app.router.add_post("/api/search/playlist", search_playlist)
     app.router.add_post("/api/download/single", download_single)
     app.router.add_post("/api/download/playlist", download_playlist)
     app.router.add_post("/api/download/clear", clear_queue)
+    app.router.add_post("/api/download/stop", stop_downloads)
+    app.router.add_post("/api/download/remove", remove_from_queue)
     app.router.add_get("/api/track-cover", track_cover)
     app.router.add_get("/api/files", list_files)
     app.router.add_post("/api/files/rename", rename_file)
