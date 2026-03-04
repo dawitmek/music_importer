@@ -58,7 +58,8 @@ let isMultiSelectMode = false;
 let longPressTimer = null;
 let viewMode = 'auto'; // 'auto', 'grid', 'list'
 let coverQueue = [];
-let processingCover = false;
+let activeCoverFetches = 0;
+const COVER_CONCURRENCY = 5;
 
 // ── WebSocket ────────────────────────────
 function connectWS(){
@@ -75,7 +76,14 @@ function connectWS(){
   };
   ws.onmessage=e=>{
     const{event,data}=JSON.parse(e.data);
-    if(event==='status'){wsStatus=data;updateUI(data);}
+    if(event==='status'){
+      wsStatus=data;
+      updateUI(data);
+      if(data.library_size != null){
+        const el=document.getElementById('dash-storage-val');
+        if(el) el.textContent=fmtBytes(data.library_size);
+      }
+    }
   };
 }
 
@@ -178,7 +186,7 @@ function updateUI(s){
     qItem.className = `queue-item ${status}`;
     qItem.style.animationDelay = `${idx*.04}s`;
     qItem.innerHTML = `
-      <img class="q-cover" src="/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}" onerror="this.src='/api/track-cover'" loading="lazy"/>
+      <img class="q-cover" src="${item.cover || `/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}`}" onerror="this.src='/api/track-cover'" loading="lazy"/>
       <div class="q-info"><div class="q-title">${esc(item.title)}</div><div class="q-artist">${esc(item.artist||'—')}</div>${prog}</div>
       <span class="q-status ${status}">${status}</span>
       <div class="q-actions"></div>
@@ -396,24 +404,22 @@ async function doPlaylistSearch(url){
             const playlistTitle = data.title || 'Unknown Playlist';
             statusEl.textContent=`Found ${tracks.length} tracks in "${playlistTitle}". Staging…`;
             let added=0;
+            const newlyAdded=[];
             tracks.forEach(t=>{
                 if(!stagingTracks.find(st=>st.title===t.title&&st.artist===t.artist)){
                     t.playlist_name = playlistTitle;
-                    // Ensure unique ID for background update tracking
                     t.tempId = Math.random().toString(36).substring(7);
                     stagingTracks.push(t);
+                    newlyAdded.push(t);
                     added++;
-                    
-                    // Fetch cover in background if missing
-                    if(!t.cover || t.cover === '') {
-                        fetchCoverInBackground(t);
-                    }
+                    if(!t.cover || t.cover === '') fetchCoverInBackground(t);
                 }
             });
             renderStaging();
             statusEl.textContent=`Added ${added} new tracks from "${playlistTitle}" to staging.`;
             toast(`Added ${added} tracks`,'success');
             sInput.value='';
+            if(newlyAdded.length) checkDownloadedStatus(newlyAdded);
         }
     }catch(e){
         statusEl.textContent='Failed to fetch playlist';
@@ -423,23 +429,18 @@ async function doPlaylistSearch(url){
 
 function fetchCoverInBackground(track) {
     coverQueue.push(track);
-    if (!processingCover) {
-        processCoverQueue();
+    pumpCoverQueue();
+}
+
+function pumpCoverQueue() {
+    while (activeCoverFetches < COVER_CONCURRENCY && coverQueue.length > 0) {
+        activeCoverFetches++;
+        fetchOneCover(coverQueue.shift());
     }
 }
 
-async function processCoverQueue() {
-    if (coverQueue.length === 0) {
-        processingCover = false;
-        return;
-    }
-
-    processingCover = true;
-    const track = coverQueue.shift();
-    
-    // Track retry attempts
+async function fetchOneCover(track) {
     if (track.coverRetries === undefined) track.coverRetries = 0;
-
     try {
         const r = await fetch(`/api/track-cover?artist=${enc(track.artist)}&title=${enc(track.title)}`);
         if (r.ok) {
@@ -454,17 +455,14 @@ async function processCoverQueue() {
         }
     } catch (e) {
         console.warn(`Failed to fetch cover for ${track.title} (Attempt ${track.coverRetries + 1}/3)`, e);
-        
-        if (track.coverRetries < 2) { // 0, 1, 2 = 3 attempts total
+        if (track.coverRetries < 2) {
             track.coverRetries++;
-            // Push back to the end of the queue to try again later
             coverQueue.push(track);
         }
+    } finally {
+        activeCoverFetches--;
+        pumpCoverQueue();
     }
-
-    // Small delay between requests to be gentle. 
-    // If we just failed, we might want to wait a bit longer, but sequential processing naturally provides some gap.
-    setTimeout(processCoverQueue, 150);
 }
 
 function renderSug(tracks){
@@ -546,10 +544,34 @@ document.getElementById('add-manual').addEventListener('click',()=>{
 // ── Staging ──────────────────────────────
 function addToStaging(track){
   if(stagingTracks.find(t=>t.title===track.title&&t.artist===track.artist)){toast('Already staged','info');return;}
+  track.tempId = track.tempId || Math.random().toString(36).substring(7);
   stagingTracks.push(track);renderStaging();
   sugEl.classList.add('hidden');
   saveToHistory('track', track);
   toast(`Staged: ${track.title}`,'success');
+  checkDownloadedStatus([track]);
+}
+
+async function checkDownloadedStatus(tracks) {
+    try {
+        const r = await fetch('/api/download/check', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({tracks: tracks.map(t => ({title: t.title, artist: t.artist, playlist_name: t.playlist_name || null}))})
+        });
+        if (!r.ok) return;
+        const results = await r.json();
+        let changed = false;
+        results.forEach(res => {
+            if (!res.downloaded) return;
+            const staged = stagingTracks.find(t => t.title === res.title && t.artist === res.artist && (t.playlist_name || null) === (res.playlist_name || null));
+            if (staged && !staged.alreadyDownloaded) {
+                staged.alreadyDownloaded = true;
+                changed = true;
+            }
+        });
+        if (changed) renderStaging();
+    } catch(e) { /* non-critical */ }
 }
 
 async function retryTrack(id){
@@ -577,10 +599,12 @@ function renderStaging(){
   
   stagingTracks.forEach((t, i) => {
       const item = document.createElement('div');
-      item.className = 'staging-item';
+      item.className = 'staging-item' + (t.alreadyDownloaded ? ' already-downloaded' : '');
+      const badge = t.alreadyDownloaded ? `<span class="staging-badge-downloaded" title="Already downloaded">✓ downloaded</span>` : '';
       item.innerHTML = `
         <img class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
         <div style="flex:1;min-width:0"><div class="staging-title">${esc(t.title)}</div><div class="staging-artist">${esc(t.artist||'—')}</div></div>
+        ${badge}
         <button class="staging-remove">✕</button>
       `;
       item.querySelector('.staging-remove').addEventListener('click', () => removeStaging(i));
@@ -601,7 +625,8 @@ document.getElementById('sync-all').addEventListener('click',async()=>{
           playlist_name:t.playlist_name
       }))})});
     const data=await r.json();
-    toast(`Queued ${data.count} tracks ⚡`,'success');
+    const skippedMsg = data.skipped > 0 ? `, ${data.skipped} already downloaded` : '';
+    toast(`Queued ${data.count} tracks${skippedMsg}`,'success');
     stagingTracks=[];renderStaging();
   }catch{toast('Failed to queue tracks','error');}
 });

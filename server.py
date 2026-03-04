@@ -266,6 +266,7 @@ DOWNLOAD_STATUS: dict = {
     "batch_total": 0,
     "batch_completed": 0,
     "last_batch_finished_at": None,
+    "library_size": 0,
 }
 
 DEEZER_MAX_QUALITY = None  # Persistent memory for account capability (0, 1, 2, 3)
@@ -348,6 +349,37 @@ def deezer_cover_url(artist: str, title: str) -> Optional[str]:
     if tracks and tracks[0].get("album", {}).get("cover_medium"):
         return tracks[0]["album"]["cover_medium"]
     return None
+
+
+# Simple LRU cache for cover URLs: key=(artist, title) -> image bytes or None
+_COVER_CACHE: dict = {}
+_COVER_CACHE_MAX = 500
+
+async def _fetch_cover_bytes(artist: str, title: str) -> Optional[bytes]:
+    """Async: look up cover URL from Deezer and fetch image bytes. Uses in-memory cache."""
+    cache_key = (artist.lower().strip(), title.lower().strip())
+    if cache_key in _COVER_CACHE:
+        return _COVER_CACHE[cache_key]
+
+    # Look up URL via Deezer search (still sync, but runs in executor to avoid blocking)
+    loop = asyncio.get_event_loop()
+    url = await loop.run_in_executor(None, deezer_cover_url, artist, title)
+
+    result = None
+    if url:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status == 200:
+                        result = await r.read()
+        except Exception:
+            pass
+
+    # Evict oldest entry if cache is full
+    if len(_COVER_CACHE) >= _COVER_CACHE_MAX:
+        _COVER_CACHE.pop(next(iter(_COVER_CACHE)))
+    _COVER_CACHE[cache_key] = result
+    return result
 
 
 def read_arl() -> Optional[str]:
@@ -602,6 +634,7 @@ async def process_download(item: dict):
             add_log(f"✗ Failed: {artist} - {title}", "ERROR")
         save_status()
     await broadcast()
+    asyncio.ensure_future(refresh_library_size())
 
 
 # ── Background worker ──────────────────────────────────────────────────────────
@@ -990,18 +1023,50 @@ async def download_single(request):
     return web.json_response({"ok": True, "id": item["id"]})
 
 
+_AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".ogg", ".opus"}
+
+def is_already_downloaded(artist: str, title: str, playlist_name: str | None) -> bool:
+    """Return True if the expected output directory already contains an audio file."""
+    label = sanitize_filename(f"{artist} - {title}" if artist else title)
+    if playlist_name:
+        out_dir = PLAYLISTS_DIR / sanitize_filename(str(playlist_name)) / label
+    else:
+        out_dir = SINGLES_DIR / label
+    if not out_dir.exists():
+        return False
+    return any(f.suffix.lower() in _AUDIO_EXTS for f in out_dir.iterdir() if f.is_file())
+
+
+async def check_downloaded(request):
+    body = await request.json()
+    tracks = body.get("tracks", [])
+    results = []
+    for t in tracks:
+        already = is_already_downloaded(t.get("artist", ""), t.get("title", ""), t.get("playlist_name"))
+        results.append({"title": t.get("title"), "artist": t.get("artist"), "playlist_name": t.get("playlist_name"), "downloaded": already})
+    return web.json_response(results)
+
+
 async def download_playlist(request):
     body = await request.json()
     tracks = body.get("tracks", [])
     ids = []
+    skipped = 0
     async with DOWNLOAD_LOCK:
+        to_queue = []
+        for t in tracks:
+            if is_already_downloaded(t.get("artist", ""), t.get("title", ""), t.get("playlist_name")):
+                skipped += 1
+            else:
+                to_queue.append(t)
+
         if not DOWNLOAD_STATUS["queue"] and not DOWNLOAD_STATUS["active"]:
-            DOWNLOAD_STATUS["batch_total"] = len(tracks)
+            DOWNLOAD_STATUS["batch_total"] = len(to_queue)
             DOWNLOAD_STATUS["batch_completed"] = 0
         else:
-            DOWNLOAD_STATUS["batch_total"] += len(tracks)
-            
-        for t in tracks:
+            DOWNLOAD_STATUS["batch_total"] += len(to_queue)
+
+        for t in to_queue:
             p_name = t.get("playlist_name")
             item = {
                 "id": str(uuid.uuid4()),
@@ -1018,7 +1083,7 @@ async def download_playlist(request):
             ids.append(item["id"])
         save_status()
     await broadcast()
-    return web.json_response({"ok": True, "ids": ids, "count": len(ids)})
+    return web.json_response({"ok": True, "ids": ids, "count": len(ids), "skipped": skipped})
 
 
 async def clear_queue(request):
@@ -1123,19 +1188,11 @@ async def track_cover(request):
             if p.exists():
                 return web.FileResponse(p)
 
-    # 2. Fetch from Deezer
+    # 2. Fetch from Deezer (async, cached)
     if artist or title:
-        url = deezer_cover_url(artist, title)
-        if url:
-            try:
-                r = requests.get(url, timeout=8)
-                if r.status_code == 200:
-                    return web.Response(
-                        body=r.content,
-                        content_type=r.headers.get("Content-Type", "image/jpeg"),
-                    )
-            except Exception:
-                pass
+        data = await _fetch_cover_bytes(artist, title)
+        if data:
+            return web.Response(body=data, content_type="image/jpeg")
 
     # 3. Return placeholder SVG
     svg = """<svg xmlns="http://www.w3.org/2000/svg" width="250" height="250" viewBox="0 0 250 250">
@@ -1149,6 +1206,14 @@ async def track_cover(request):
 
 def get_folder_size(path: Path) -> int:
     return sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+
+
+async def refresh_library_size():
+    """Recompute DOWNLOADS_DIR size in a thread and push it via broadcast."""
+    loop = asyncio.get_event_loop()
+    size = await loop.run_in_executor(None, get_folder_size, DOWNLOADS_DIR)
+    DOWNLOAD_STATUS["library_size"] = size
+    await broadcast()
 
 
 async def list_files(request):
@@ -1323,6 +1388,11 @@ async def spotify_login(request):
 
     # Use configured redirect_uri or auto-detect from request
     config_redirect = get_val_from_content(content, "redirect_uri", "spotify")
+    if config_redirect:
+        if not config_redirect.startswith(("http://", "https://")):
+            config_redirect = "http://" + config_redirect
+        if not config_redirect.rstrip("/").endswith("/api/spotify/callback"):
+            config_redirect = config_redirect.rstrip("/") + "/api/spotify/callback"
     redirect_uri = config_redirect or f"http://{request.host}/api/spotify/callback"
     
     logger.info(f"Spotify Login: Using client_id={client_id[:5]}..., redirect_uri={redirect_uri}")
@@ -1351,7 +1421,13 @@ async def spotify_callback(request):
     content = read_config_raw()
     client_id = get_val_from_content(content, "client_id", "spotify")
     client_secret = get_val_from_content(content, "client_secret", "spotify")
-    redirect_uri = get_val_from_content(content, "redirect_uri", "spotify") or f"http://{request.host}/api/spotify/callback"
+    config_redirect = get_val_from_content(content, "redirect_uri", "spotify")
+    if config_redirect:
+        if not config_redirect.startswith(("http://", "https://")):
+            config_redirect = "http://" + config_redirect
+        if not config_redirect.rstrip("/").endswith("/api/spotify/callback"):
+            config_redirect = config_redirect.rstrip("/") + "/api/spotify/callback"
+    redirect_uri = config_redirect or f"http://{request.host}/api/spotify/callback"
 
     auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     async with aiohttp.ClientSession() as session:
@@ -1470,6 +1546,7 @@ async def on_startup(app):
     load_status()
     asyncio.create_task(queue_worker())
     add_log("Music Vault server started")
+    DOWNLOAD_STATUS["library_size"] = get_folder_size(DOWNLOADS_DIR)
     await broadcast()
 
 
@@ -1485,6 +1562,7 @@ def create_app():
     app.router.add_get("/api/spotify/callback", spotify_callback)
     app.router.add_post("/api/download/single", download_single)
     app.router.add_post("/api/download/playlist", download_playlist)
+    app.router.add_post("/api/download/check", check_downloaded)
     app.router.add_post("/api/download/clear", clear_queue)
     app.router.add_post("/api/download/stop", stop_downloads)
     app.router.add_post("/api/download/retry", retry_track)
