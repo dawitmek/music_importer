@@ -41,8 +41,7 @@ COPY server.py .
 COPY index.html .
 COPY static/ ./static/
 
-# Create directories
-RUN mkdir -p downloads/singles downloads/playlists data/logs config
+RUN mkdir -p downloads/singles downloads/playlists data/logs
 
 EXPOSE 8080
 
