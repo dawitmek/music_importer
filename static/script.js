@@ -366,8 +366,6 @@ function handleSearchSubmit(){
     toggleHistory(false);
 }
 
-document.addEventListener('click',e=>{if(!e.target.closest('#search-area'))sugEl.classList.add('hidden');});
-
 async function doSearch(q){
   if(!q || q.startsWith('http'))return;
   try{
@@ -447,6 +445,7 @@ async function fetchOneCover(track) {
             const staged = stagingTracks.find(st => st.tempId === track.tempId);
             if (staged) {
                 const blob = await r.blob();
+                if (staged.cover && staged.cover.startsWith('blob:')) URL.revokeObjectURL(staged.cover);
                 staged.cover = URL.createObjectURL(blob);
                 renderStaging();
             }
@@ -909,7 +908,7 @@ function updateBreadcrumb(path){
   });
 }
 
-document.getElementById('fm-search').addEventListener('input',()=>loadFiles());
+document.getElementById('fm-search').addEventListener('input',()=>renderFiles(currentItems));
 document.getElementById('view-toggle-btn').addEventListener('click', function(){
     if(viewMode === 'auto') viewMode = 'grid';
     else if(viewMode === 'grid') viewMode = 'list';
@@ -1119,6 +1118,10 @@ function getFileIcon(ext){
 }
 
 // ── Init ──────────────────────────────────
+document.getElementById('refresh-files-btn').addEventListener('click', () => loadFiles());
+document.getElementById('select-all-btn').addEventListener('click', () => toggleSelectAll());
+document.getElementById('close-image-modal-btn').addEventListener('click', () => closeModal('image-modal'));
+document.getElementById('close-rename-modal-btn').addEventListener('click', () => closeModal('rename-modal'));
 connectWS();loadConfig();loadFiles('');
 
 document.getElementById('batch-cancel').addEventListener('click', clearSelection);

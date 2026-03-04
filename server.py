@@ -153,9 +153,6 @@ def write_config_raw(content: str):
     encrypted = Vault.encrypt(content)
     CONFIG_FILE.write_text(encrypted)
 
-for d in [SINGLES_DIR, PLAYLISTS_DIR, DATA_DIR, CONFIG_DIR, LOGS_DIR]:
-    d.mkdir(parents=True, exist_ok=True)
-
 # ── Streamrip config template ──────────────────────────────────────────────────
 STREAMRIP_CONFIG_TEMPLATE = """
 [downloads]
@@ -328,6 +325,15 @@ async def ws_handler(request):
 DEEZER_BASE = "https://api.deezer.com"
 
 
+def is_safe_path(target: Path, base: Path) -> bool:
+    """Check that target is within base directory (prevents path traversal)."""
+    try:
+        target.resolve().relative_to(base.resolve())
+        return True
+    except ValueError:
+        return False
+
+
 def sanitize_filename(name: str) -> str:
     # Adding # to prevent URL fragment issues
     name = re.sub(r'[<>:"/\\|?*#]', "", name)
@@ -362,7 +368,7 @@ async def _fetch_cover_bytes(artist: str, title: str) -> Optional[bytes]:
         return _COVER_CACHE[cache_key]
 
     # Look up URL via Deezer search (still sync, but runs in executor to avoid blocking)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     url = await loop.run_in_executor(None, deezer_cover_url, artist, title)
 
     result = None
@@ -534,7 +540,7 @@ async def run_ytdlp(query: str, out_dir: Path, filename: str) -> bool:
                 shutil.copy2(str(cover_src), str(cover_dst))
                 # Remove the original to prevent duplicates
                 try: cover_src.unlink()
-                except: pass
+                except Exception: pass
             logger.info(f"Saved cover art to {cover_dst}")
         else:
             # Fallback: search for any jpg/webp thumbnail yt-dlp may have written
@@ -543,7 +549,7 @@ async def run_ytdlp(query: str, out_dir: Path, filename: str) -> bool:
                     shutil.copy2(str(thumb), str(cover_dst))
                     # Remove the original
                     try: thumb.unlink()
-                    except: pass
+                    except Exception: pass
                     logger.info(f"Saved cover art (fallback) to {cover_dst}")
                     break
 
@@ -569,13 +575,6 @@ async def process_download(item: dict):
 
     add_log(f"Starting download: {artist} - {title}")
 
-    # Move from queue to active
-    async with DOWNLOAD_LOCK:
-        DOWNLOAD_STATUS["queue"] = [x for x in DOWNLOAD_STATUS["queue"] if x["id"] != tid]
-        item["status"] = "downloading"
-        item["started_at"] = time.time()
-        DOWNLOAD_STATUS["active"].append(item)
-        save_status()
     await broadcast()
 
     success = False
@@ -589,7 +588,8 @@ async def process_download(item: dict):
         # Try to find a real Deezer ID if we only have title/artist or a non-numeric ID
         search_query = f"{artist} {title}"
         add_log(f"Searching Deezer ID for: {search_query}")
-        search_results = deezer_search(search_query, limit=1)
+        loop = asyncio.get_running_loop()
+        search_results = await loop.run_in_executor(None, lambda: deezer_search(search_query, limit=1))
         if search_results:
             deezer_id = search_results[0].get("id")
             add_log(f"Found Deezer ID: {deezer_id}")
@@ -634,18 +634,24 @@ async def process_download(item: dict):
             add_log(f"✗ Failed: {artist} - {title}", "ERROR")
         save_status()
     await broadcast()
-    asyncio.ensure_future(refresh_library_size())
+    asyncio.create_task(refresh_library_size())
 
 
 # ── Background worker ──────────────────────────────────────────────────────────
 async def queue_worker():
     while True:
+        item = None
         async with DOWNLOAD_LOCK:
             queue = DOWNLOAD_STATUS["queue"]
             active = DOWNLOAD_STATUS["active"]
+            if queue and len(active) < 3:
+                item = queue.pop(0)
+                item["status"] = "downloading"
+                item["started_at"] = time.time()
+                DOWNLOAD_STATUS["active"].append(item)
+                save_status()
 
-        if queue and len(active) < 3:
-            item = queue[0]
+        if item:
             asyncio.create_task(process_download(item))
 
         await asyncio.sleep(2)
@@ -703,7 +709,7 @@ async def search_playlist(request):
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode == 0:
                 playlist_title = stdout.decode().strip() or "Unknown YouTube Playlist"
-        except: pass
+        except Exception: pass
 
         cmd = [
             "yt-dlp",
@@ -747,7 +753,7 @@ async def search_playlist(request):
                     "cover": data.get("thumbnail", ""),
                     "id": data.get("id")
                 })
-            except: continue
+            except Exception: continue
             
         return web.json_response({"tracks": tracks, "title": playlist_title})
     except Exception as e:
@@ -1210,7 +1216,7 @@ def get_folder_size(path: Path) -> int:
 
 async def refresh_library_size():
     """Recompute DOWNLOADS_DIR size in a thread and push it via broadcast."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     size = await loop.run_in_executor(None, get_folder_size, DOWNLOADS_DIR)
     DOWNLOAD_STATUS["library_size"] = size
     await broadcast()
@@ -1220,7 +1226,7 @@ async def list_files(request):
     path_param = request.rel_url.query.get("path", "")
     base = DOWNLOADS_DIR
     target = (base / path_param).resolve()
-    if not str(target).startswith(str(base)):
+    if not is_safe_path(target, base):
         return web.json_response({"error": "forbidden"}, status=403)
     if not target.exists():
         return web.json_response({"error": "not found"}, status=404)
@@ -1259,7 +1265,7 @@ async def rename_file(request):
     rel = body.get("path", "")
     new_name = sanitize_filename(body.get("new_name", ""))
     src = (DOWNLOADS_DIR / rel).resolve()
-    if not str(src).startswith(str(DOWNLOADS_DIR)):
+    if not is_safe_path(src, DOWNLOADS_DIR):
         return web.json_response({"error": "forbidden"}, status=403)
     dst = src.parent / new_name
     src.rename(dst)
@@ -1270,7 +1276,7 @@ async def delete_file(request):
     body = await request.json()
     rel = body.get("path", "")
     target = (DOWNLOADS_DIR / rel).resolve()
-    if not str(target).startswith(str(DOWNLOADS_DIR)):
+    if not is_safe_path(target, DOWNLOADS_DIR):
         return web.json_response({"error": "forbidden"}, status=403)
     if target.is_dir():
         shutil.rmtree(target)
@@ -1283,7 +1289,7 @@ async def zip_folder(request):
     body = await request.json()
     rel = body.get("path", "")
     folder = (DOWNLOADS_DIR / rel).resolve()
-    if not str(folder).startswith(str(DOWNLOADS_DIR)) or not folder.is_dir():
+    if not is_safe_path(folder, DOWNLOADS_DIR) or not folder.is_dir():
         return web.json_response({"error": "invalid"}, status=400)
 
     zip_path = folder.parent / f"{folder.name}.zip"
@@ -1310,7 +1316,7 @@ async def zip_files_batch(request):
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for p in paths:
                     target = (DOWNLOADS_DIR / p).resolve()
-                    if not str(target).startswith(str(DOWNLOADS_DIR)) or not target.exists():
+                    if not is_safe_path(target, DOWNLOADS_DIR) or not target.exists():
                         continue
                     if target.is_dir():
                         for f in target.rglob("*"):
@@ -1328,7 +1334,7 @@ async def zip_files_batch(request):
 async def serve_file(request):
     rel = request.match_info.get("path", "")
     target = (DOWNLOADS_DIR / rel).resolve()
-    if not str(target).startswith(str(DOWNLOADS_DIR)) or not target.is_file():
+    if not is_safe_path(target, DOWNLOADS_DIR) or not target.is_file():
         raise web.HTTPNotFound()
     return web.FileResponse(target)
 
@@ -1495,25 +1501,12 @@ async def get_config(request):
     cfg = {"arl": "", "quality": "FLAC", "spotify_id": "", "spotify_secret": "", "deps": {}}
     content = read_config_raw()
     if content:
-        # Simple regex extraction for each section
-        def get_val(key, section):
-            # Find the section first
-            s_match = re.search(r'\[' + section + r'\](.*?)(?=\[|$)', content, re.DOTALL)
-            if s_match:
-                section_text = s_match.group(1)
-                # More robust: optional quotes, strip whitespace
-                m_id = re.search(key + r'\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', section_text)
-                if not m_id:
-                    m_id = re.search(key + r'\s*=\s*([^\s,]+)', section_text)
-                return m_id.group(1).strip() if m_id else ""
-            return ""
+        cfg["arl"] = get_val_from_content(content, "arl", "deezer")
+        cfg["spotify_id"] = get_val_from_content(content, "client_id", "spotify")
+        cfg["spotify_secret"] = get_val_from_content(content, "client_secret", "spotify")
+        cfg["spotify_redirect"] = get_val_from_content(content, "redirect_uri", "spotify")
 
-        cfg["arl"] = get_val("arl", "deezer")
-        cfg["spotify_id"] = get_val("client_id", "spotify")
-        cfg["spotify_secret"] = get_val("client_secret", "spotify")
-        cfg["spotify_redirect"] = get_val("redirect_uri", "spotify")
-        
-        val_q = get_val("quality", "downloads")
+        val_q = get_val_from_content(content, "quality", "downloads")
         if val_q: cfg["quality"] = val_q
             
     # Check dependencies
