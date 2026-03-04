@@ -123,7 +123,7 @@ setup_config() {
 arl = ""
 
 [downloads]
-quality = "MP3_320"
+quality = "FLAC"
 EOF
     info "Created default config/config.toml — set your Deezer ARL via the web UI"
   fi

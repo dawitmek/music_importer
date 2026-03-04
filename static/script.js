@@ -369,6 +369,7 @@ async function doSearch(q){
 }
 
 async function doPlaylistSearch(url){
+    console.log('Searching playlist:', url);
     statusEl.textContent='Fetching playlist metadata...';
     try{
         const r=await fetch('/api/search/playlist',{
@@ -376,10 +377,20 @@ async function doPlaylistSearch(url){
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({url})
         });
+        console.log('Response status:', r.status);
         const data=await r.json();
         if(data.error){
-            statusEl.textContent=`Error: ${data.error}`;
-            toast(data.error,'error');
+            let msg = data.error;
+            if(data.details) {
+                try {
+                    const details = JSON.parse(data.details);
+                    msg += `: ${details.error_description || details.error || data.details}`;
+                } catch(e) {
+                    msg += `: ${data.details}`;
+                }
+            }
+            statusEl.textContent=`Error: ${msg}`;
+            toast(msg,'error');
         }else{
             const tracks=data.tracks||[];
             const playlistTitle = data.title || 'Unknown Playlist';
@@ -979,8 +990,25 @@ async function loadConfig(){
   const r=await fetch('/api/config');const cfg=await r.json();
   document.getElementById('cfg-arl').value=cfg.arl||'';
   document.getElementById('cfg-quality').value=cfg.quality||'MP3_320';
+  document.getElementById('cfg-spotify-id').value=cfg.spotify_id||'';
+  document.getElementById('cfg-spotify-secret').value=cfg.spotify_secret||'';
   
+  if(cfg.spotify_redirect) document.getElementById('cfg-spotify-redirect').value = cfg.spotify_redirect;
+
+  // Update the display-only redirect URI
+  const currentHost = window.location.host;
+  const redirectDisplay = document.getElementById('display-redirect-uri');
+  if(redirectDisplay) {
+    const uri = `http://${currentHost}/api/spotify/callback`;
+    redirectDisplay.textContent = uri;
+    redirectDisplay.onclick = () => {
+        navigator.clipboard.writeText(uri);
+        toast('Copied to clipboard!', 'info');
+    };
+  }
+
   if(cfg.deps){
+
       const sr = document.getElementById('dep-streamrip');
       const yt = document.getElementById('dep-ytdlp');
       if(sr) sr.innerHTML = `streamrip: <span style="color:${cfg.deps.streamrip ? 'var(--emerald)' : 'var(--rose)'}">${cfg.deps.streamrip ? 'INSTALLED' : 'MISSING'}</span>`;
@@ -994,8 +1022,25 @@ async function loadConfig(){
 document.getElementById('save-config-btn').addEventListener('click',async()=>{
   const arl=document.getElementById('cfg-arl').value.trim();
   const quality=document.getElementById('cfg-quality').value;
-  await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({arl,quality})});
+  const spotify_id=document.getElementById('cfg-spotify-id').value.trim();
+  const spotify_secret=document.getElementById('cfg-spotify-secret').value.trim();
+  const spotify_redirect=document.getElementById('cfg-spotify-redirect').value.trim();
+  
+  await fetch('/api/config',{
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({arl,quality,spotify_id,spotify_secret,spotify_redirect})
+  });
   toast('Configuration saved!','success');
+});
+
+document.getElementById('spotify-login-btn').addEventListener('click',()=>{
+    const id = document.getElementById('cfg-spotify-id').value.trim();
+    if(!id) {
+        toast('Enter Client ID first and Save','error');
+        return;
+    }
+    window.open('/api/spotify/login', '_blank');
 });
 
 // ── Tabs ──────────────────────────────────

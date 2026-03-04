@@ -219,25 +219,56 @@
       <section class="tab-panel" id="tab-config">
         <div class="page-header">
           <div class="section-title">Configuration</div>
-          <div class="section-sub">Set your Deezer ARL and download preferences.</div>
+          <div class="section-sub">Set your Deezer ARL, Spotify API, and download preferences.</div>
         </div>
+        
         <div class="card">
           <div class="card-glow" style="background:var(--gold-glow)"></div>
-          <div class="card-title">Deezer Settings</div>
-          <div class="config-field">
-            <label class="config-label">Deezer ARL Cookie</label>
-            <input type="password" class="config-input" id="cfg-arl" placeholder="Paste your ARL token here…" autocomplete="off" data-bwignore/>
-            <div class="config-hint">Find in browser cookies at deezer.com → arl value. Required for FLAC/high-quality downloads.</div>
+          <div class="card-title">Music Vault Settings</div>
+          
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+            <div>
+              <div class="config-field">
+                <label class="config-label">Deezer ARL Cookie</label>
+                <input type="password" class="config-input" id="cfg-arl" placeholder="Paste your ARL token here…" autocomplete="off" data-bwignore/>
+                <div class="config-hint">Required for FLAC/high-quality downloads.</div>
+              </div>
+              <div class="config-field">
+                <label class="config-label">Audio Quality</label>
+                <select class="config-input" id="cfg-quality">
+                  <option value="FLAC" selected>FLAC (Lossless)</option>
+                  <option value="MP3_320">MP3 320kbps</option>
+                  <option value="MP3_128">MP3 128kbps</option>
+                </select>
+              </div>
+            </div>
+            <div>
+              <div class="config-field">
+                <label class="config-label">Spotify Client ID</label>
+                <input type="text" class="config-input" id="cfg-spotify-id" placeholder="Your Client ID..." autocomplete="off"/>
+                <div class="config-hint">Required for large playlists (>100 tracks).</div>
+              </div>
+              <div class="config-field">
+                <label class="config-label">Spotify Client Secret</label>
+                <input type="password" class="config-input" id="cfg-spotify-secret" placeholder="Your Client Secret..." autocomplete="off"/>
+              </div>
+              <div class="config-field">
+                <label class="config-label">Spotify Redirect URI</label>
+                <input type="text" class="config-input" id="cfg-spotify-redirect" placeholder="Auto-detected..." autocomplete="off"/>
+                <div style="font-size:11px; color:var(--muted); margin-top:4px;">
+                  Copy this to Spotify Dashboard: <br/>
+                  <code id="display-redirect-uri" style="color:var(--cyan); cursor:pointer">loading...</code>
+                </div>
+              </div>
+              <div class="config-field">
+                <button class="btn btn-ghost" id="spotify-login-btn" style="width:100%; border:1px solid var(--cyan); color:var(--cyan)">
+                  🔐 Login to Spotify (Get All Tracks)
+                </button>
+              </div>
+            </div>
           </div>
-          <div class="config-field">
-            <label class="config-label">Audio Quality</label>
-            <select class="config-input" id="cfg-quality">
-              <option value="FLAC">FLAC (Lossless)</option>
-              <option value="MP3_320" selected>MP3 320kbps</option>
-              <option value="MP3_128">MP3 128kbps</option>
-            </select>
-          </div>
-          <button class="btn btn-primary" id="save-config-btn">💾 Save Configuration</button>
+          
+          <button class="btn btn-primary" id="save-config-btn" style="margin-top:10px; width:100%">💾 Save All Settings</button>
         </div>
         <div class="card">
           <div class="card-title">Download Fallback Chain</div>

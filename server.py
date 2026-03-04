@@ -43,6 +43,21 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 FRONTEND_DIR = BASE_DIR if (BASE_DIR / "index.html").exists() else BASE_DIR / "frontend"
 KEY_FILE = CONFIG_DIR / ".vaultkey"
 
+for d in [SINGLES_DIR, PLAYLISTS_DIR, DATA_DIR, CONFIG_DIR, LOGS_DIR]:
+    d.mkdir(parents=True, exist_ok=True)
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+log_file = LOGS_DIR / f"musicvault_{datetime.now().strftime('%Y%m%d')}.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler(),
+    ],
+)
+logger = logging.getLogger("musicvault")
+
 # ── Encryption Helper ────────────────────────────────────────────────────────
 class Vault:
     _memory_key: Optional[bytes] = None
@@ -121,29 +136,25 @@ def read_config_raw() -> str:
     if not CONFIG_FILE.exists():
         return ""
     content = CONFIG_FILE.read_text()
-    if "[deezer]" not in content and "[downloads]" not in content:
-        return Vault.decrypt(content)
-    return content
+    if not content:
+        return ""
 
+    # Try to decrypt. If it fails or returns garbage (non-UTF8),
+    # the Vault.decrypt helper returns the original string.
+    decrypted = Vault.decrypt(content)
+
+    # If the decrypted version looks like valid config, use it.
+    # Otherwise, assume it was already plain text.
+    if "[deezer]" in decrypted or "[downloads]" in decrypted or "[spotify]" in decrypted:
+        return decrypted
+
+    return content
 def write_config_raw(content: str):
     encrypted = Vault.encrypt(content)
     CONFIG_FILE.write_text(encrypted)
 
 for d in [SINGLES_DIR, PLAYLISTS_DIR, DATA_DIR, CONFIG_DIR, LOGS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
-
-# ── Logging ────────────────────────────────────────────────────────────────────
-log_file = LOGS_DIR / f"musicvault_{datetime.now().strftime('%Y%m%d')}.log"
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(log_file),
-        logging.StreamHandler(),
-    ],
-)
-logger = logging.getLogger("musicvault")
-
 
 # ── Streamrip config template ──────────────────────────────────────────────────
 STREAMRIP_CONFIG_TEMPLATE = """
@@ -630,8 +641,20 @@ async def search_suggestions(request):
 
 async def search_playlist(request):
     try:
-        body = await request.json()
-        url = body.get("url", "")
+        url = ""
+        if request.content_type == 'application/json':
+            body = await request.json()
+            url = body.get("url", "")
+        else:
+            data = await request.post()
+            url = data.get("url", "")
+            
+        if not url:
+            # Try query params as last resort
+            url = request.query.get("url", "")
+
+        logger.info(f"Playlist search request for URL: {url}")
+        
         if not url:
             return web.json_response({"error": "No URL provided"}, status=400)
 
@@ -702,9 +725,205 @@ async def search_playlist(request):
 async def handle_spotify_playlist(url):
     try:
         playlist_id = re.search(r'playlist/([a-zA-Z0-9]+)', url).group(1)
-        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
         
+        # Check for Spotify API credentials in config
+        content = read_config_raw()
+        client_id = get_val_from_content(content, "client_id", "spotify")
+        client_secret = get_val_from_content(content, "client_secret", "spotify")
+        user_access_token = get_val_from_content(content, "access_token", "spotify")
+        user_refresh_token = get_val_from_content(content, "refresh_token", "spotify")
+
+        if client_id and client_secret:
+            token_to_use = None
+            if user_access_token:
+                # Try using user token first (unlimited tracks)
+                token_to_use = user_access_token
+                add_log(f"Fetching playlist {playlist_id} using Spotify User Auth...")
+            
+            # If we have a token (or can get a client credentials one as fallback)
+            # handle_spotify_playlist_api now accepts an optional existing token
+            return await handle_spotify_playlist_api(playlist_id, client_id, client_secret, token_to_use, user_refresh_token)
+        
+        # Fallback to scraping (limited to 100)
+        add_log(f"No Spotify API credentials, using scraper for {playlist_id}...")
+        return await handle_spotify_playlist_scrape(playlist_id)
+    except Exception as e:
+        logger.exception("Spotify playlist handling failed")
+        return web.json_response({"error": f"Spotify error: {str(e)}"}, status=500)
+
+async def handle_spotify_playlist_api(playlist_id, client_id, client_secret, token=None, refresh_token=None):
+    try:
+        access_token = token
+        # Track whether we have a real user OAuth token or just client credentials.
+        # Since Spotify's 2024 API change, client_credentials tokens are REJECTED (403)
+        # on all playlist endpoints — only user-authenticated tokens work.
+        using_user_token = token is not None
+
+        async with aiohttp.ClientSession() as session:
+            # No user token available — attempt client credentials as a last resort.
+            # NOTE: As of Spotify's 2024 API policy change, this will receive a 403
+            # on playlist endpoints. We try anyway so we can surface a clear error.
+            if not access_token:
+                auth_url = "https://accounts.spotify.com/api/token"
+                auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+                async with session.post(auth_url, data={"grant_type": "client_credentials"}, headers={"Authorization": f"Basic {auth_str}"}) as resp:
+                    if resp.status == 200:
+                        auth_data = await resp.json()
+                        access_token = auth_data.get("access_token")
+                        using_user_token = False
+                    else:
+                        err = await resp.text()
+                        logger.error(f"Client credentials auth failed ({resp.status}): {err}")
+                        return web.json_response({
+                            "error": "Spotify authentication failed. Check your Client ID and Secret in Settings.",
+                            "requires_spotify_login": True
+                        }, status=401)
+
+            if not access_token:
+                logger.warning("No Spotify token available after auth attempt")
+                return await handle_spotify_playlist_scrape(playlist_id)
+
+            # Returns (tracks, name, error_status).
+            # error_status is None on success, or the HTTP status code on auth failure.
+            async def fetch_tracks(token_to_use):
+                headers = {"Authorization": f"Bearer {token_to_use}"}
+                playlist_url = f"https://api.spotify.com/v1/playlists/{playlist_id}"
+                playlist_name = "Unknown Spotify Playlist"
+
+                async with session.get(playlist_url, headers=headers) as resp:
+                    if resp.status == 200:
+                        p_data = await resp.json()
+                        playlist_name = p_data.get("name", "Unknown Spotify Playlist")
+                    elif resp.status in (401, 403):
+                        err_body = await resp.text()
+                        logger.warning(f"Spotify playlist metadata fetch {resp.status}: {err_body[:200]}")
+                        return None, None, resp.status
+                    else:
+                        err_text = await resp.text()
+                        logger.error(f"Spotify playlist fetch failed ({resp.status}): {err_text[:200]}")
+                        return [], "Error", resp.status
+
+                tracks = []
+                next_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items?limit=100"
+                while next_url:
+                    logger.info(f"API: Fetching page from {next_url}")
+                    async with session.get(next_url, headers=headers) as resp:
+                        if resp.status == 200:
+                            t_data = await resp.json()
+                            items = t_data.get("items", [])
+                            null_count = 0
+                            local_count = 0
+                            logger.info(f"API: Received {len(items)} items")
+
+                            # Log the first item's raw structure once so we can
+                            # diagnose unexpected API response shapes.
+                            if items and len(tracks) == 0:
+                                first_item = items[0]
+                                first_t = first_item.get("item") or first_item.get("track")
+                                if first_t is None:
+                                    logger.warning(f"API: First item has no track data. Keys: {list(first_item.keys())}")
+                            for item in items:
+                                # Spotify renamed this field from "track" to "item"
+                                # in their 2026 playlist endpoint response.
+                                # We check both for backwards compatibility.
+                                t = item.get("item") or item.get("track")
+                                if t is None:
+                                    null_count += 1
+                                    continue
+                                if not isinstance(t, dict):
+                                    logger.warning(f"API: track field is not a dict: {type(t)}")
+                                    continue
+                                # Skip local files — they have no Spotify ID
+                                if t.get("is_local"):
+                                    local_count += 1
+                                    continue
+                                artists = ", ".join([a.get("name", "Unknown") for a in t.get("artists", [])])
+                                album = t.get("album", {})
+                                images = album.get("images", [])
+                                cover = images[0].get("url", "") if images else ""
+                                tracks.append({
+                                    "title": t.get("name", "Unknown"),
+                                    "artist": artists,
+                                    "album": album.get("name", ""),
+                                    "duration": t.get("duration_ms", 0) / 1000,
+                                    "cover": cover,
+                                    "id": t.get("id", "")
+                                })
+
+                            if null_count:
+                                logger.warning(f"API: Skipped {null_count} null/unavailable tracks on this page")
+                            if local_count:
+                                logger.info(f"API: Skipped {local_count} local files on this page")
+                            logger.info(f"API: Running total — {len(tracks)} valid tracks so far")
+                            next_url = t_data.get("next")
+                            logger.info(f"API: Next page URL: {next_url}")
+                            if len(tracks) > 2000:
+                                break
+                        elif resp.status in (401, 403):
+                            err_body = await resp.text()
+                            logger.warning(f"API items loop got {resp.status}: {err_body[:200]}")
+                            return None, None, resp.status
+                        else:
+                            err_text = await resp.text()
+                            logger.error(f"Spotify items fetch failed ({resp.status}): {err_text[:200]}")
+                            break
+                return tracks, playlist_name, None
+
+            # ── First attempt ──────────────────────────────────────────────────
+            tracks, name, err_status = await fetch_tracks(access_token)
+
+            # ── Handle auth errors ─────────────────────────────────────────────
+            if tracks is None:
+                if err_status == 401 and refresh_token:
+                    # Token expired — refresh and retry once
+                    add_log("Spotify access token expired, refreshing...", "WARNING")
+                    new_token = await refresh_spotify_token(client_id, client_secret, refresh_token)
+                    if new_token:
+                        tracks, name, err_status = await fetch_tracks(new_token)
+
+                # After refresh attempt (or if no refresh token), still failing
+                if tracks is None:
+                    if err_status == 403 or not using_user_token:
+                        # 403 = Spotify is rejecting our token type entirely.
+                        # This is expected when using client_credentials since Spotify's
+                        # 2024 policy change removed client credentials access to playlist
+                        # endpoints. A user OAuth token is now required.
+                        msg = (
+                            "Spotify now requires user login to fetch playlist tracks. "
+                            "Please go to Settings → Spotify and click 'Login with Spotify' "
+                            "to authorize your account, then try again."
+                        )
+                        add_log(msg, "WARNING")
+                        return web.json_response({
+                            "error": msg,
+                            "requires_spotify_login": True
+                        }, status=403)
+                    else:
+                        # 401 after refresh failed — token may be revoked
+                        msg = (
+                            "Spotify session expired and could not be refreshed. "
+                            "Please re-login via Settings → Spotify."
+                        )
+                        add_log(msg, "WARNING")
+                        return web.json_response({
+                            "error": msg,
+                            "requires_spotify_login": True
+                        }, status=401)
+
+            add_log(f"Successfully fetched {len(tracks)} tracks from Spotify API.")
+            return web.json_response({"tracks": tracks, "title": name})
+
+    except Exception as e:
+        logger.exception("Spotify API handling failed")
+        # Only use scraper as fallback for unexpected errors (network issues, etc.)
+        return await handle_spotify_playlist_scrape(playlist_id)
+
+async def handle_spotify_playlist_scrape(playlist_id):
+    # Current scraping logic (keeps 100 track limit for unauthenticated users)
+    try:
+        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(embed_url) as resp:
                 if resp.status != 200:
@@ -742,8 +961,7 @@ async def handle_spotify_playlist(url):
             
         return web.json_response({"tracks": tracks, "title": playlist_name})
     except Exception as e:
-        logger.exception("Spotify playlist handling failed")
-        return web.json_response({"error": f"Spotify error: {str(e)}"}, status=500)
+        raise e
 
 
 async def download_single(request):
@@ -1058,30 +1276,169 @@ async def save_config(request):
     global DEEZER_MAX_QUALITY
     body = await request.json()
     arl = body.get("arl", "")
-    quality = body.get("quality", "MP3_320")
+    quality = body.get("quality", "FLAC")
+    spotify_id = body.get("spotify_id", "")
+    spotify_secret = body.get("spotify_secret", "")
+    spotify_redirect = body.get("spotify_redirect", "")
+
+    # Keep existing tokens if not provided in the save (don't overwrite with empty)
+    existing_content = read_config_raw()
+    spotify_access_token = get_val_from_content(existing_content, "access_token", "spotify")
+    spotify_refresh_token = get_val_from_content(existing_content, "refresh_token", "spotify")
+
     toml_content = f"""[deezer]
 arl = "{arl}"
+
+[spotify]
+client_id = "{spotify_id}"
+client_secret = "{spotify_secret}"
+redirect_uri = "{spotify_redirect}"
+access_token = "{spotify_access_token}"
+refresh_token = "{spotify_refresh_token}"
 
 [downloads]
 folder = "{DOWNLOADS_DIR}"
 quality = "{quality}"
 """
     write_config_raw(toml_content)
-    # Reset probing memory when config changes
     DEEZER_MAX_QUALITY = None
     return web.json_response({"ok": True})
 
+def get_val_from_content(content, key, section):
+    if not content: return ""
+    s_match = re.search(r'\[' + section + r'\](.*?)(?=\[|$)', content, re.DOTALL)
+    if s_match:
+        section_text = s_match.group(1)
+        m = re.search(key + r'\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', section_text)
+        if not m: m = re.search(key + r'\s*=\s*([^\s,]+)', section_text)
+        return m.group(1).strip() if m else ""
+    return ""
+
+async def spotify_login(request):
+    import urllib.parse
+    content = read_config_raw()
+    client_id = get_val_from_content(content, "client_id", "spotify")
+    if not client_id:
+        return web.json_response({"error": "Spotify Client ID not configured"}, status=400)
+
+    # Use configured redirect_uri or auto-detect from request
+    config_redirect = get_val_from_content(content, "redirect_uri", "spotify")
+    redirect_uri = config_redirect or f"http://{request.host}/api/spotify/callback"
+    
+    logger.info(f"Spotify Login: Using client_id={client_id[:5]}..., redirect_uri={redirect_uri}")
+    
+    scope = "playlist-read-private playlist-read-collaborative user-library-read"
+    state = str(uuid.uuid4())
+
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "scope": scope,
+        "redirect_uri": redirect_uri,
+        "state": state
+    }
+    auth_url = f"https://accounts.spotify.com/authorize?{urllib.parse.urlencode(params)}"
+    return web.HTTPFound(auth_url)
+
+async def spotify_callback(request):
+    code = request.query.get("code")
+    error = request.query.get("error")
+    if error:
+        return web.Response(text=f"Spotify Auth Error: {error}", status=400)
+    if not code:
+        return web.Response(text="No code received", status=400)
+
+    content = read_config_raw()
+    client_id = get_val_from_content(content, "client_id", "spotify")
+    client_secret = get_val_from_content(content, "client_secret", "spotify")
+    redirect_uri = get_val_from_content(content, "redirect_uri", "spotify") or f"http://{request.host}/api/spotify/callback"
+
+    auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://accounts.spotify.com/api/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri
+            },
+            headers={"Authorization": f"Basic {auth_str}"}
+        ) as resp:
+            if resp.status != 200:
+                err = await resp.text()
+                return web.Response(text=f"Failed to exchange token: {err}", status=400)
+
+            data = await resp.json()
+            access_token = data.get("access_token")
+            refresh_token = data.get("refresh_token")
+            logger.info(f"spotify_callback: Received access_token={access_token[:10]}..., refresh_token={refresh_token[:10] if refresh_token else 'NONE'}")
+
+            # Update config with new tokens
+            cfg_text = read_config_raw()
+            logger.info(f"spotify_callback: Current config length: {len(cfg_text)}")
+            # Surgical update to just tokens
+            if 'access_token =' in cfg_text:
+                new_cfg = re.sub(r'access_token\s*=\s*".*?"', f'access_token = "{access_token}"', cfg_text)
+            else:
+                new_cfg = cfg_text.replace('[spotify]', f'[spotify]\naccess_token = "{access_token}"')
+            
+            if 'refresh_token =' in new_cfg:
+                new_cfg = re.sub(r'refresh_token\s*=\s*".*?"', f'refresh_token = "{refresh_token}"', new_cfg)
+            else:
+                new_cfg = new_cfg.replace('access_token =', f'refresh_token = "{refresh_token}"\naccess_token =')
+                
+            write_config_raw(new_cfg)
+            logger.info("spotify_callback: Config updated with new tokens")
+
+    return web.Response(text="Successfully logged into Spotify! You can close this window and try your import again.", content_type="text/html")
+
+async def refresh_spotify_token(client_id, client_secret, refresh_token):
+    logger.info(f"Refreshing Spotify token using refresh_token: {refresh_token[:10]}...")
+    auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            "https://accounts.spotify.com/api/token",
+            data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+            headers={"Authorization": f"Basic {auth_str}"}
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                new_access = data.get("access_token")
+                logger.info("Spotify token refresh successful")
+                # Save new token
+                cfg_text = read_config_raw()
+                new_cfg = re.sub(r'access_token\s*=\s*".*?"', f'access_token = "{new_access}"', cfg_text)
+                write_config_raw(new_cfg)
+                return new_access
+            else:
+                err = await resp.text()
+                logger.error(f"Spotify token refresh failed ({resp.status}): {err}")
+    return None
 
 async def get_config(request):
-    cfg = {"arl": "", "quality": "MP3_320", "deps": {}}
+    cfg = {"arl": "", "quality": "FLAC", "spotify_id": "", "spotify_secret": "", "deps": {}}
     content = read_config_raw()
     if content:
-        m = re.search(r'arl\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', content)
-        if m:
-            cfg["arl"] = m.group(1)
-        m = re.search(r'quality\s*=\s*"([^"]*)"', content)
-        if m:
-            cfg["quality"] = m.group(1)
+        # Simple regex extraction for each section
+        def get_val(key, section):
+            # Find the section first
+            s_match = re.search(r'\[' + section + r'\](.*?)(?=\[|$)', content, re.DOTALL)
+            if s_match:
+                section_text = s_match.group(1)
+                # More robust: optional quotes, strip whitespace
+                m_id = re.search(key + r'\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', section_text)
+                if not m_id:
+                    m_id = re.search(key + r'\s*=\s*([^\s,]+)', section_text)
+                return m_id.group(1).strip() if m_id else ""
+            return ""
+
+        cfg["arl"] = get_val("arl", "deezer")
+        cfg["spotify_id"] = get_val("client_id", "spotify")
+        cfg["spotify_secret"] = get_val("client_secret", "spotify")
+        cfg["spotify_redirect"] = get_val("redirect_uri", "spotify")
+        
+        val_q = get_val("quality", "downloads")
+        if val_q: cfg["quality"] = val_q
             
     # Check dependencies
     # Standard check
@@ -1124,6 +1481,8 @@ def create_app():
     app.router.add_get("/ws/status", ws_handler)
     app.router.add_get("/api/search/suggestions", search_suggestions)
     app.router.add_post("/api/search/playlist", search_playlist)
+    app.router.add_get("/api/spotify/login", spotify_login)
+    app.router.add_get("/api/spotify/callback", spotify_callback)
     app.router.add_post("/api/download/single", download_single)
     app.router.add_post("/api/download/playlist", download_playlist)
     app.router.add_post("/api/download/clear", clear_queue)
