@@ -341,6 +341,18 @@ def sanitize_filename(name: str) -> str:
     return name[:200]
 
 
+def clean_track_title(title: str) -> str:
+    """Removes common YouTube/Spotify fluff like (Official Video), [Prod by ...], etc."""
+    if not title: return ""
+    # Remove things like (Official Music Video), [Official Audio], [Prod. by BNX]
+    title = re.sub(r'(?i)\s*[\[\(](official.*?|video|audio|lyric.*?|visualizer|prod\.?\s*by.*?)[\]\)]', '', title)
+    # Remove "- Official Video" or "- Prod. by" at the end
+    title = re.sub(r'(?i)\s*-\s*(official.*?|prod\.?\s*by).*$', '', title)
+    # Clean up any leftover trailing dashes or whitespace
+    title = re.sub(r'\s*-\s*$', '', title)
+    return title.strip()
+
+
 def deezer_search(q: str, limit: int = 10):
     try:
         r = requests.get(f"{DEEZER_BASE}/search", params={"q": q, "limit": limit}, timeout=8)
@@ -668,7 +680,7 @@ async def search_suggestions(request):
     for t in tracks:
         results.append({
             "id": t.get("id"),
-            "title": t.get("title", ""),
+            "title": clean_track_title(t.get("title", "")),
             "artist": t.get("artist", {}).get("name", ""),
             "album": t.get("album", {}).get("title", ""),
             "duration": t.get("duration", 0),
@@ -704,11 +716,16 @@ async def search_playlist(request):
         # For YouTube and others, get playlist title first
         title_cmd = ["yt-dlp", "--flat-playlist", "--print", "%(playlist_title)s", "--playlist-items", "1", url]
         playlist_title = "Unknown Playlist"
+        is_single = False
         try:
             proc = await asyncio.create_subprocess_exec(*title_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode == 0:
-                playlist_title = stdout.decode().strip() or "Unknown YouTube Playlist"
+                raw_title = stdout.decode().strip()
+                if raw_title == "NA":
+                    is_single = True
+                elif raw_title:
+                    playlist_title = raw_title
         except Exception: pass
 
         cmd = [
@@ -746,7 +763,7 @@ async def search_playlist(request):
                     title = parts[1].strip()
 
                 tracks.append({
-                    "title": title,
+                    "title": clean_track_title(title),
                     "artist": artist,
                     "album": data.get("album", ""),
                     "duration": data.get("duration", 0),
@@ -755,7 +772,7 @@ async def search_playlist(request):
                 })
             except Exception: continue
             
-        return web.json_response({"tracks": tracks, "title": playlist_title})
+        return web.json_response({"tracks": tracks, "title": playlist_title, "is_single": is_single})
     except Exception as e:
         logger.exception("Playlist search failed")
         return web.json_response({"error": str(e)}, status=500)
@@ -796,7 +813,7 @@ async def handle_spotify_playlist(url):
             t_cover = c_sources[0].get("url", playlist_cover) if c_sources else playlist_cover
             
             tracks.append({
-                "title": t.get("title", "Unknown"),
+                "title": clean_track_title(t.get("title", "Unknown")),
                 "artist": t.get("subtitle", "Unknown Artist"),
                 "album": "",
                 "duration": t.get("duration", 0) / 1000,
@@ -925,7 +942,7 @@ async def handle_spotify_playlist_api(playlist_id, client_id, client_secret, tok
                                 images = album.get("images", [])
                                 cover = images[0].get("url", "") if images else ""
                                 tracks.append({
-                                    "title": t.get("name", "Unknown"),
+                                    "title": clean_track_title(t.get("name", "Unknown")),
                                     "artist": artists,
                                     "album": album.get("name", ""),
                                     "duration": t.get("duration_ms", 0) / 1000,

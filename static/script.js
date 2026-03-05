@@ -336,7 +336,7 @@ sInput.addEventListener('input',()=>{
   // If it looks like a URL, don't show Deezer suggestions
   if(q.startsWith('http')){
       sugEl.classList.add('hidden');
-      statusEl.textContent = 'Playlist URL detected. Press Enter or click ⌕ to fetch.';
+      statusEl.textContent = 'URL detected. Press Enter or click ⌕ to fetch.';
       return;
   }
   
@@ -399,13 +399,22 @@ async function doPlaylistSearch(url){
             toast(msg,'error');
         }else{
             const tracks=data.tracks||[];
+            const isSingle = data.is_single === true;
             const playlistTitle = data.title || 'Unknown Playlist';
-            statusEl.textContent=`Found ${tracks.length} tracks in "${playlistTitle}". Staging…`;
+            
+            if (isSingle) {
+                statusEl.textContent=`Found single track. Staging…`;
+            } else {
+                statusEl.textContent=`Found ${tracks.length} tracks in "${playlistTitle}". Staging…`;
+            }
+            
             let added=0;
             const newlyAdded=[];
             tracks.forEach(t=>{
                 if(!stagingTracks.find(st=>st.title===t.title&&st.artist===t.artist)){
-                    t.playlist_name = playlistTitle;
+                    if (!isSingle) {
+                        t.playlist_name = playlistTitle;
+                    }
                     t.tempId = Math.random().toString(36).substring(7);
                     stagingTracks.push(t);
                     newlyAdded.push(t);
@@ -414,7 +423,11 @@ async function doPlaylistSearch(url){
                 }
             });
             renderStaging();
-            statusEl.textContent=`Added ${added} new tracks from "${playlistTitle}" to staging.`;
+            if (isSingle) {
+                statusEl.textContent=`Added 1 single track to staging.`;
+            } else {
+                statusEl.textContent=`Added ${added} new tracks from "${playlistTitle}" to staging.`;
+            }
             toast(`Added ${added} tracks`,'success');
             sInput.value='';
             if(newlyAdded.length) checkDownloadedStatus(newlyAdded);
