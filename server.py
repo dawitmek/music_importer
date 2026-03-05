@@ -344,13 +344,67 @@ def sanitize_filename(name: str) -> str:
 def clean_track_title(title: str) -> str:
     """Removes common YouTube/Spotify fluff like (Official Video), [Prod by ...], etc."""
     if not title: return ""
-    # Remove things like (Official Music Video), [Official Audio], [Prod. by BNX]
-    title = re.sub(r'(?i)\s*[\[\(](official.*?|video|audio|lyric.*?|visualizer|prod\.?\s*by.*?)[\]\)]', '', title)
-    # Remove "- Official Video" or "- Prod. by" at the end
-    title = re.sub(r'(?i)\s*-\s*(official.*?|prod\.?\s*by).*$', '', title)
-    # Clean up any leftover trailing dashes or whitespace
+    
+    # 1. Remove tags in brackets/parentheses
+    # includes "Official...", "Music Video", "Video", "Audio", "Lyric...", "Visualizer", "Prod...", "Produced...", "Best Version", "Slowed", "Reverb", "Shot By...", "Directed By..."
+    pattern = r'(?i)\s*[\[\(](official.*?|music\s+video|video|audio|lyric.*?|visualizer|prod\..*?|produced.*?|best\s+version|slowed.*?|reverb.*?|(?:shot|directed|dir\.?)\s*by.*?)[\]\)]'
+    # Loop to ensure we catch back-to-back brackets e.g. "(Dir by @x)(Produced by y)"
+    while re.search(pattern, title):
+        title = re.sub(pattern, '', title)
+
+    # 2. Remove trailing "Shot By" or "Directed By" or "Dir by" (without brackets)
+    title = re.sub(r'(?i)\s*(?:shot|directed|dir\.?)\s*by\s*@?.*$', '', title)
+    
+    # 3. Remove "- Official Video" or "- Prod. by" at the end
+    title = re.sub(r'(?i)\s*-\s*(official.*?|prod\..*?|produced.*?).*$', '', title)
+    
+    # 4. Clean up any leftover trailing dashes or whitespace
     title = re.sub(r'\s*-\s*$', '', title)
+    
+    # 5. Remove surrounding quotes if the entire title is wrapped in them
+    title = re.sub(r'^["\'](.*)["\']$', r'\1', title)
+    
     return title.strip()
+
+def normalize_features(artist_str: str, title_str: str, channel_name: str = "") -> tuple:
+    """Attempts to intelligently separate main artist and feature, placing feature in title."""
+    main_artist = artist_str
+    features = ""
+    
+    # 1. First, check if features are explicitly in the title: "Song (feat. X)"
+    feat_match = re.search(r'(?i)[\[\(](?:feat\.?|ft\.?|featuring)\s+(.*?)[\]\)]', title_str)
+    if feat_match:
+        features = feat_match.group(1).strip()
+        # Remove from title temporarily
+        title_str = re.sub(r'(?i)\s*[\[\(](?:feat\.?|ft\.?|featuring)\s+(.*?)[\]\)]', '', title_str).strip()
+        
+    # 2. If no features in title, check if artist string is a list (e.g. "Artist1 & Artist2")
+    if not features and artist_str:
+        # Split by common delimiters
+        parts = re.split(r'(?i)\s+(?:&|x|ft\.?|feat\.?|featuring|,)\s+', artist_str)
+        if len(parts) > 1:
+            # We have multiple artists. Try to use channel name to find the main one.
+            if channel_name:
+                for i, p in enumerate(parts):
+                    # If part matches channel name (or close enough), it's the main artist
+                    if p.lower() in channel_name.lower() or channel_name.lower() in p.lower():
+                        main_artist = p.strip()
+                        features = ", ".join([x.strip() for j, x in enumerate(parts) if j != i])
+                        break
+                else:
+                    # If channel doesn't match any, assume first is main
+                    main_artist = parts[0].strip()
+                    features = ", ".join([x.strip() for x in parts[1:]])
+            else:
+                main_artist = parts[0].strip()
+                features = ", ".join([x.strip() for x in parts[1:]])
+                
+    # 3. Format output
+    # If we found features, append them cleanly to the title
+    if features:
+        title_str = f"{title_str} (feat. {features})"
+        
+    return main_artist, title_str
 
 
 def deezer_search(q: str, limit: int = 10):
@@ -518,7 +572,7 @@ async def run_streamrip(track_id: str, out_dir: Path) -> bool:
     return False
 
 
-async def run_ytdlp(query: str, out_dir: Path, filename: str) -> bool:
+async def run_ytdlp(query: str, out_dir: Path, filename: str, metadata_artist: str = "", metadata_title: str = "", metadata_album: str = "") -> bool:
     safe = sanitize_filename(filename)
     out_tmpl = str(out_dir / f"{safe}.%(ext)s")
     cmd = [
@@ -531,8 +585,16 @@ async def run_ytdlp(query: str, out_dir: Path, filename: str) -> bool:
         "--embed-thumbnail",          # embed cover art into the .mp3 file
         "--write-thumbnail",          # also save thumbnail as a separate file
         "--convert-thumbnails", "jpg", # ensure thumbnail is saved as JPEG
-        "--add-metadata",
+        "--embed-metadata",
     ]
+    
+    if metadata_artist:
+        cmd.extend(["--parse-metadata", f"{metadata_artist}:%(artist)s"])
+    if metadata_title:
+        cmd.extend(["--parse-metadata", f"{metadata_title}:%(title)s"])
+    if metadata_album:
+        cmd.extend(["--parse-metadata", f"{metadata_album}:%(album)s"])
+        
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -574,6 +636,7 @@ async def process_download(item: dict):
     tid = item["id"]
     artist = item.get("artist", "")
     title = item.get("title", "")
+    album = item.get("album", "")
     deezer_id = item.get("deezer_id")
     
     # Determine output directory
@@ -618,9 +681,9 @@ async def process_download(item: dict):
 
     # Step 2: Fallback to yt-dlp
     if not success:
-        add_log(f"Falling back to yt-dlp for: {artist} - {title}", "WARNING")
+        add_log(f"Falling back to yt-dlp for: {artist} - {title}", "INFO")
         query = f"{artist} {title} official audio" if artist else title
-        success = await run_ytdlp(query, out_dir, f"{artist} - {title}" if artist else title)
+        success = await run_ytdlp(query, out_dir, f"{artist} - {title}" if artist else title, metadata_artist=artist, metadata_title=title, metadata_album=album)
         if success:
             method = "youtube"
             add_log(f"✓ YouTube fallback succeeded: {title}")
@@ -754,16 +817,28 @@ async def search_playlist(request):
             try:
                 data = json.loads(line)
                 title = data.get("title", "Unknown")
-                artist = data.get("artist") or data.get("uploader") or data.get("channel", "Unknown Artist")
+                channel = data.get("channel") or data.get("uploader", "")
+                artist = data.get("artist") or channel or "Unknown Artist"
                 
-                # If title looks like "Artist - Song", split it
-                if " - " in title and (not data.get("artist") or data.get("artist") == "Unknown Artist"):
-                    parts = title.split(" - ", 1)
-                    artist = parts[0].strip()
-                    title = parts[1].strip()
+                # Prioritize extracting artist from title format if yt-dlp artist is missing or equal to channel
+                if not data.get("artist") or data.get("artist") == "Unknown Artist" or artist == channel:
+                    if " - " in title:
+                        parts = title.split(" - ", 1)
+                        artist = parts[0].strip()
+                        title = parts[1].strip()
+                    else:
+                        # Match: Artist "Title" (including smart quotes) + whatever fluff comes after
+                        match = re.search(r'^(.*?)\s+["“”\'](.*?)["“”\'](.*)$', title)
+                        if match:
+                            artist = match.group(1).strip()
+                            # Recombine title without quotes, leaving the fluff at the end for the cleaner
+                            title = match.group(2).strip() + " " + match.group(3).strip()
+
+                title = clean_track_title(title)
+                artist, title = normalize_features(artist, title, channel)
 
                 tracks.append({
-                    "title": clean_track_title(title),
+                    "title": title,
                     "artist": artist,
                     "album": data.get("album", ""),
                     "duration": data.get("duration", 0),
