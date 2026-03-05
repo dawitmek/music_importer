@@ -603,20 +603,27 @@ async function retryTrack(id){
     } catch(e) { toast('Failed to retry track', 'error'); }
 }
 
+let lastSelectedIdx = null;
+
 function renderStaging(){
   const el=document.getElementById('staging');
   const cnt=document.getElementById('staging-count');
   cnt.textContent=`${stagingTracks.length} track${stagingTracks.length!==1?'s':''} staged`;
   el.innerHTML = '';
   
+  const removeSelectedBtn = document.getElementById('remove-selected');
+  const hasSelected = stagingTracks.some(t => t.selected);
+  removeSelectedBtn.style.display = hasSelected ? 'inline-block' : 'none';
+  
   if(!stagingTracks.length){
       el.innerHTML=`<div class="staging-empty">No tracks staged — search and add songs above</div>`;
+      lastSelectedIdx = null;
       return;
   }
   
   stagingTracks.forEach((t, i) => {
       const item = document.createElement('div');
-      item.className = 'staging-item' + (t.alreadyDownloaded ? ' already-downloaded' : '');
+      item.className = 'staging-item' + (t.alreadyDownloaded ? ' already-downloaded' : '') + (t.selected ? ' selected' : '');
       const badge = t.alreadyDownloaded ? `<span class="staging-badge-downloaded" title="Already downloaded">✓ downloaded</span>` : '';
       item.innerHTML = `
         <img id="cover-${t.tempId}" class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
@@ -624,11 +631,74 @@ function renderStaging(){
         ${badge}
         <button class="staging-remove">✕</button>
       `;
-      item.querySelector('.staging-remove').addEventListener('click', () => removeStaging(i));
+      
+      item.addEventListener('click', (e) => {
+          if (e.target.classList.contains('staging-remove')) return;
+          
+          if (e.shiftKey && lastSelectedIdx !== null) {
+              const start = Math.min(lastSelectedIdx, i);
+              const end = Math.max(lastSelectedIdx, i);
+              for (let j = start; j <= end; j++) {
+                  stagingTracks[j].selected = true;
+              }
+          } else if (e.metaKey || e.ctrlKey) {
+              t.selected = !t.selected;
+              lastSelectedIdx = i;
+          } else {
+              t.selected = !t.selected;
+              lastSelectedIdx = i;
+          }
+          
+          // Fast UI update without rebuilding DOM
+          updateStagingSelectionUI();
+      });
+
+      item.querySelector('.staging-remove').addEventListener('click', (e) => {
+          e.stopPropagation();
+          removeStaging(i);
+      });
       el.appendChild(item);
   });
 }
-function removeStaging(i){stagingTracks.splice(i,1);renderStaging();}
+
+function updateStagingSelectionUI() {
+    const el = document.getElementById('staging');
+    const items = el.querySelectorAll('.staging-item');
+    
+    stagingTracks.forEach((t, i) => {
+        if (items[i]) {
+            if (t.selected) {
+                items[i].classList.add('selected');
+            } else {
+                items[i].classList.remove('selected');
+            }
+        }
+    });
+
+    const removeSelectedBtn = document.getElementById('remove-selected');
+    const hasSelected = stagingTracks.some(t => t.selected);
+    removeSelectedBtn.style.display = hasSelected ? 'inline-block' : 'none';
+}
+
+function removeStaging(i){
+    stagingTracks.splice(i,1);
+    lastSelectedIdx = null;
+    renderStaging();
+}
+document.getElementById('remove-selected').addEventListener('click', () => {
+    stagingTracks = stagingTracks.filter(t => !t.selected);
+    lastSelectedIdx = null;
+    renderStaging();
+});
+document.getElementById('toggle-staging-expand').addEventListener('click', (e) => {
+    const el = document.getElementById('staging');
+    el.classList.toggle('expanded');
+    if (el.classList.contains('expanded')) {
+        e.target.textContent = '⤡ Collapse';
+    } else {
+        e.target.textContent = '⤢ Expand';
+    }
+});
 document.getElementById('clear-staging').addEventListener('click',()=>{stagingTracks=[];renderStaging();});
 document.getElementById('sync-all').addEventListener('click',async()=>{
   if(!stagingTracks.length){toast('Nothing staged!','error');return;}
