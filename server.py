@@ -944,7 +944,8 @@ async def handle_spotify_playlist(url):
 
         # Fallback: if no credentials exist, we just return what we scraped from the embed
         add_log(f"No Spotify API credentials, using scraped tracks for {playlist_id}...")
-        return web.json_response({"tracks": tracks, "title": playlist_name})    except Exception as e:
+        return web.json_response({"tracks": tracks, "title": playlist_name})
+    except Exception as e:
         logger.exception("Spotify playlist handling failed")
         return web.json_response({"error": f"Spotify error: {str(e)}"}, status=500)
 
