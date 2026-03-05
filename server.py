@@ -765,6 +765,50 @@ async def handle_spotify_playlist(url):
     try:
         playlist_id = re.search(r'playlist/([a-zA-Z0-9]+)', url).group(1)
         
+        # Check the length first by parsing through the playlist embed
+        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(embed_url) as resp:
+                if resp.status != 200:
+                    return web.json_response({"error": f"Spotify returned status {resp.status}"}, status=resp.status)
+                html = await resp.text()
+                
+        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">([^<]+)</script>', html)
+        if not match:
+            return web.json_response({"error": "Failed to parse Spotify metadata"}, status=500)
+            
+        data = json.loads(match.group(1))
+        entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})
+        track_list = entity.get('trackList', [])
+        playlist_name = entity.get('name', 'Unknown Spotify Playlist')
+        
+        # Get playlist cover
+        playlist_cover = ""
+        sources = entity.get('coverArt', {}).get('sources', [])
+        if sources:
+            playlist_cover = sources[0].get('url', '')
+        
+        tracks = []
+        for t in track_list:
+            c_sources = t.get("coverArt", {}).get("sources", [])
+            t_cover = c_sources[0].get("url", playlist_cover) if c_sources else playlist_cover
+            
+            tracks.append({
+                "title": t.get("title", "Unknown"),
+                "artist": t.get("subtitle", "Unknown Artist"),
+                "album": "",
+                "duration": t.get("duration", 0) / 1000,
+                "cover": t_cover,
+                "id": t.get("uri", "").split(":")[-1]
+            })
+
+        # If the length of the tracks are less than or equal to 99, move the tracks that were parsed to staging
+        if len(tracks) <= 99:
+            return web.json_response({"tracks": tracks, "title": playlist_name})
+
+        # If the length is 100 (or more), call the previously wrapped function
         # Check for Spotify API credentials in config
         content = read_config_raw()
         client_id = get_val_from_content(content, "client_id", "spotify")
@@ -783,9 +827,9 @@ async def handle_spotify_playlist(url):
             # handle_spotify_playlist_api now accepts an optional existing token
             return await handle_spotify_playlist_api(playlist_id, client_id, client_secret, token_to_use, user_refresh_token)
         
-        # Fallback to scraping (limited to 100)
+        # No Spotify API credentials, using scraped tracks
         add_log(f"No Spotify API credentials, using scraper for {playlist_id}...")
-        return await handle_spotify_playlist_scrape(playlist_id)
+        return web.json_response({"tracks": tracks, "title": playlist_name})
     except Exception as e:
         logger.exception("Spotify playlist handling failed")
         return web.json_response({"error": f"Spotify error: {str(e)}"}, status=500)
@@ -820,7 +864,7 @@ async def handle_spotify_playlist_api(playlist_id, client_id, client_secret, tok
 
             if not access_token:
                 logger.warning("No Spotify token available after auth attempt")
-                return await handle_spotify_playlist_scrape(playlist_id)
+                return web.json_response({"error": "Spotify authentication failed. No token available."}, status=401)
 
             # Returns (tracks, name, error_status).
             # error_status is None on success, or the HTTP status code on auth failure.
@@ -840,7 +884,7 @@ async def handle_spotify_playlist_api(playlist_id, client_id, client_secret, tok
                     else:
                         err_text = await resp.text()
                         logger.error(f"Spotify playlist fetch failed ({resp.status}): {err_text[:200]}")
-                        return [], "Error", resp.status
+                        raise Exception(f"Spotify API error {resp.status}: {err_text}")
 
                 tracks = []
                 next_url = f"https://api.spotify.com/v1/playlists/{playlist_id}/items?limit=100"
@@ -905,7 +949,7 @@ async def handle_spotify_playlist_api(playlist_id, client_id, client_secret, tok
                         else:
                             err_text = await resp.text()
                             logger.error(f"Spotify items fetch failed ({resp.status}): {err_text[:200]}")
-                            break
+                            raise Exception(f"Spotify API error {resp.status}: {err_text}")
                 return tracks, playlist_name, None
 
             # ── First attempt ──────────────────────────────────────────────────
@@ -927,11 +971,7 @@ async def handle_spotify_playlist_api(playlist_id, client_id, client_secret, tok
                         # This is expected when using client_credentials since Spotify's
                         # 2024 policy change removed client credentials access to playlist
                         # endpoints. A user OAuth token is now required.
-                        msg = (
-                            "Spotify now requires user login to fetch playlist tracks. "
-                            "Please go to Settings → Spotify and click 'Login with Spotify' "
-                            "to authorize your account, then try again."
-                        )
+                        msg = "Spotify login required for this playlist. Please log in via Settings."
                         add_log(msg, "WARNING")
                         return web.json_response({
                             "error": msg,
@@ -954,54 +994,7 @@ async def handle_spotify_playlist_api(playlist_id, client_id, client_secret, tok
 
     except Exception as e:
         logger.exception("Spotify API handling failed")
-        # Only use scraper as fallback for unexpected errors (network issues, etc.)
-        return await handle_spotify_playlist_scrape(playlist_id)
-
-async def handle_spotify_playlist_scrape(playlist_id):
-    # Current scraping logic (keeps 100 track limit for unauthenticated users)
-    try:
-        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
-        headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        
-        async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(embed_url) as resp:
-                if resp.status != 200:
-                    return web.json_response({"error": f"Spotify returned status {resp.status}"}, status=resp.status)
-                html = await resp.text()
-                
-        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">([^<]+)</script>', html)
-        if not match:
-            return web.json_response({"error": "Failed to parse Spotify metadata"}, status=500)
-            
-        data = json.loads(match.group(1))
-        entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})
-        track_list = entity.get('trackList', [])
-        playlist_name = entity.get('name', 'Unknown Spotify Playlist')
-        
-        # Get playlist cover
-        playlist_cover = ""
-        sources = entity.get('coverArt', {}).get('sources', [])
-        if sources:
-            playlist_cover = sources[0].get('url', '')
-        
-        tracks = []
-        for t in track_list:
-            c_sources = t.get("coverArt", {}).get("sources", [])
-            t_cover = c_sources[0].get("url", playlist_cover) if c_sources else playlist_cover
-            
-            tracks.append({
-                "title": t.get("title", "Unknown"),
-                "artist": t.get("subtitle", "Unknown Artist"),
-                "album": "",
-                "duration": t.get("duration", 0) / 1000,
-                "cover": t_cover,
-                "id": t.get("uri", "").split(":")[-1]
-            })
-            
-        return web.json_response({"tracks": tracks, "title": playlist_name})
-    except Exception as e:
-        raise e
-
+        return web.json_response({"error": f"Spotify API handling failed: {str(e)}"}, status=500)
 
 async def download_single(request):
     body = await request.json()
