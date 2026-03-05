@@ -296,7 +296,8 @@ async def broadcast(event: str = "status"):
     global WS_CLIENTS
     dead = set()
     payload = json.dumps({"event": event, "data": DOWNLOAD_STATUS})
-    for ws in WS_CLIENTS:
+    # Iterate over a copy of the set to avoid RuntimeError: Set changed size during iteration
+    for ws in list(WS_CLIENTS):
         try:
             await ws.send_str(payload)
         except Exception:
@@ -444,6 +445,8 @@ async def _fetch_cover_bytes(artist: str, title: str) -> Optional[bytes]:
                 async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as r:
                     if r.status == 200:
                         result = await r.read()
+        except asyncio.CancelledError:
+            raise
         except Exception:
             pass
 

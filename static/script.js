@@ -460,7 +460,12 @@ async function fetchOneCover(track) {
                 const blob = await r.blob();
                 if (staged.cover && staged.cover.startsWith('blob:')) URL.revokeObjectURL(staged.cover);
                 staged.cover = URL.createObjectURL(blob);
-                renderStaging();
+                
+                // Directly update the image element if it exists in the DOM to avoid re-rendering everything
+                const imgEl = document.getElementById(`cover-${track.tempId}`);
+                if (imgEl) {
+                    imgEl.src = staged.cover;
+                }
             }
         } else {
             throw new Error(`Status ${r.status}`);
@@ -614,7 +619,7 @@ function renderStaging(){
       item.className = 'staging-item' + (t.alreadyDownloaded ? ' already-downloaded' : '');
       const badge = t.alreadyDownloaded ? `<span class="staging-badge-downloaded" title="Already downloaded">✓ downloaded</span>` : '';
       item.innerHTML = `
-        <img class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
+        <img id="cover-${t.tempId}" class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
         <div style="flex:1;min-width:0"><div class="staging-title">${esc(t.title)}</div><div class="staging-artist">${esc(t.artist||'—')}</div></div>
         ${badge}
         <button class="staging-remove">✕</button>
@@ -1118,7 +1123,7 @@ function toast(msg,type='info'){
 }
 
 // ── Utils ─────────────────────────────────
-function enc(s){return encodeURIComponent(s||'')}
+function enc(s){return encodeURIComponent(s||'').replace(/'/g, "%27")}
 function urlEnc(path){
     return (path||'').split('/').map(p => encodeURIComponent(p)).join('/');
 }
