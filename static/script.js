@@ -438,12 +438,15 @@ async function doPlaylistSearch(url){
     }
 }
 
+// Background queue for fetching track covers from Deezer/Backend
+// This prevents overwhelming the server with hundreds of simultaneous image requests
 function fetchCoverInBackground(track) {
     coverQueue.push(track);
     pumpCoverQueue();
 }
 
 function pumpCoverQueue() {
+    // Only fetch up to COVER_CONCURRENCY images at a time
     while (activeCoverFetches < COVER_CONCURRENCY && coverQueue.length > 0) {
         activeCoverFetches++;
         fetchOneCover(coverQueue.shift());
@@ -633,23 +636,27 @@ function renderStaging(){
       `;
       
       item.addEventListener('click', (e) => {
+          // Ignore clicks on the remove button so it doesn't toggle selection before deleting
           if (e.target.classList.contains('staging-remove')) return;
           
           if (e.shiftKey && lastSelectedIdx !== null) {
+              // Shift-click: Select a range between the last clicked item and the currently clicked item
               const start = Math.min(lastSelectedIdx, i);
               const end = Math.max(lastSelectedIdx, i);
               for (let j = start; j <= end; j++) {
                   stagingTracks[j].selected = true;
               }
           } else if (e.metaKey || e.ctrlKey) {
+              // Cmd/Ctrl-click: Toggle individual selection without resetting others
               t.selected = !t.selected;
               lastSelectedIdx = i;
           } else {
+              // Normal click: Just toggle the single item
               t.selected = !t.selected;
               lastSelectedIdx = i;
           }
           
-          // Fast UI update without rebuilding DOM
+          // Fast UI update without rebuilding DOM to prevent CSS animations from replaying
           updateStagingSelectionUI();
       });
 
@@ -661,6 +668,7 @@ function renderStaging(){
   });
 }
 
+// Lightweight function that only updates CSS classes to reflect selection state
 function updateStagingSelectionUI() {
     const el = document.getElementById('staging');
     const items = el.querySelectorAll('.staging-item');
@@ -675,6 +683,7 @@ function updateStagingSelectionUI() {
         }
     });
 
+    // Show/hide the "Remove Selected" button based on whether any tracks are currently selected
     const removeSelectedBtn = document.getElementById('remove-selected');
     const hasSelected = stagingTracks.some(t => t.selected);
     removeSelectedBtn.style.display = hasSelected ? 'inline-block' : 'none';

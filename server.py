@@ -343,32 +343,38 @@ def sanitize_filename(name: str) -> str:
 
 
 def clean_track_title(title: str) -> str:
-    """Removes common YouTube/Spotify fluff like (Official Video), [Prod by ...], etc."""
+    """
+    Removes common YouTube/Spotify fluff like (Official Video), [Prod by ...], etc.
+    This ensures clean filenames and improves matching when searching Deezer for high-quality audio.
+    """
     if not title: return ""
     
     # 1. Remove tags in brackets/parentheses
-    # includes "Official...", "Music Video", "Video", "Audio", "Lyric...", "Visualizer", "Prod...", "Produced...", "Best Version", "Slowed", "Reverb", "Shot By...", "Directed By..."
+    # Repeatedly loops to catch multiple adjacent tags like "(Dir by X)(Produced by Y)"
     pattern = r'(?i)\s*[\[\(](official.*?|music\s+video|video|audio|lyric.*?|visualizer|prod\..*?|produced.*?|best\s+version|slowed.*?|reverb.*?|(?:shot|directed|dir\.?)\s*by.*?)[\]\)]'
-    # Loop to ensure we catch back-to-back brackets e.g. "(Dir by @x)(Produced by y)"
     while re.search(pattern, title):
         title = re.sub(pattern, '', title)
 
-    # 2. Remove trailing "Shot By" or "Directed By" or "Dir by" (without brackets)
+    # 2. Remove trailing "Shot By" or "Directed By" or "Dir by" that aren't wrapped in brackets
     title = re.sub(r'(?i)\s*(?:shot|directed|dir\.?)\s*by\s*@?.*$', '', title)
     
-    # 3. Remove "- Official Video" or "- Prod. by" at the end
+    # 3. Remove "- Official Video" or "- Prod. by" appended at the very end
     title = re.sub(r'(?i)\s*-\s*(official.*?|prod\..*?|produced.*?).*$', '', title)
     
-    # 4. Clean up any leftover trailing dashes or whitespace
+    # 4. Clean up any leftover trailing dashes or whitespace that the previous steps left behind
     title = re.sub(r'\s*-\s*$', '', title)
     
-    # 5. Remove surrounding quotes if the entire title is wrapped in them
+    # 5. Remove surrounding quotes if the entire title is wrapped in them (e.g. '"Song Name"')
     title = re.sub(r'^["\'](.*)["\']$', r'\1', title)
     
     return title.strip()
 
 def normalize_features(artist_str: str, title_str: str, channel_name: str = "") -> tuple:
-    """Attempts to intelligently separate main artist and feature, placing feature in title."""
+    """
+    Intelligently separates main artist from featured artists, placing the features cleanly into the title.
+    When a title has multiple artists (e.g., A & B), it uses the YouTube channel name to figure out
+    who the primary artist is.
+    """
     main_artist = artist_str
     features = ""
     
@@ -475,6 +481,11 @@ def read_arl() -> Optional[str]:
 
 # ── Download engine ────────────────────────────────────────────────────────────
 async def run_streamrip(track_id: str, out_dir: Path) -> bool:
+    """
+    Attempts to download a track from Deezer using streamrip.
+    It will automatically 'step down' in quality if the user's account doesn't support 
+    the requested bitrate (e.g. trying to download FLAC on a free account).
+    """
     global DEEZER_MAX_QUALITY
     arl = read_arl()
     if not arl:
@@ -659,7 +670,8 @@ async def process_download(item: dict):
     method = "unknown"
 
     # Step 1: Try streamrip (Deezer)
-    # Ensure we have a valid numeric Deezer ID. Spotify IDs are alphanumeric strings.
+    # We prioritize downloading the official, high-bitrate studio file from Deezer.
+    # If the track came from YouTube, it won't have a numeric deezer_id, so we must search for it first.
     is_valid_deezer_id = str(deezer_id).isdigit() if deezer_id else False
 
     if not is_valid_deezer_id:
@@ -682,7 +694,9 @@ async def process_download(item: dict):
             method = "deezer"
             add_log(f"✓ Deezer download succeeded: {title}")
 
-    # Step 2: Fallback to yt-dlp
+    # Step 2: Fallback to yt-dlp (YouTube)
+    # If Deezer doesn't have the track (e.g. an unreleased leak or underground mix), or
+    # if streamrip fails due to regional blocks, we gracefully fallback to ripping the audio from YouTube.
     if not success:
         add_log(f"Falling back to yt-dlp for: {artist} - {title}", "INFO")
         query = f"{artist} {title} official audio" if artist else title
@@ -757,6 +771,10 @@ async def search_suggestions(request):
 
 
 async def search_playlist(request):
+    """
+    Main endpoint for parsing playlist URLs (YouTube, Spotify, Soundcloud, etc.)
+    It extracts basic metadata for all tracks and returns them to the staging area.
+    """
     try:
         url = ""
         if request.content_type == 'application/json':
@@ -779,7 +797,8 @@ async def search_playlist(request):
         if "spotify.com" in url and "playlist" in url:
             return await handle_spotify_playlist(url)
 
-        # For YouTube and others, get playlist title first
+        # For YouTube and others, get playlist title first.
+        # We use --flat-playlist to rapidly get metadata without downloading.
         title_cmd = ["yt-dlp", "--flat-playlist", "--print", "%(playlist_title)s", "--playlist-items", "1", url]
         playlist_title = "Unknown Playlist"
         is_single = False
@@ -788,6 +807,7 @@ async def search_playlist(request):
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode == 0:
                 raw_title = stdout.decode().strip()
+                # yt-dlp returns "NA" for the playlist title if the URL is a single video
                 if raw_title == "NA":
                     is_single = True
                 elif raw_title:
@@ -859,37 +879,39 @@ async def search_playlist(request):
 async def handle_spotify_playlist(url):
     try:
         playlist_id = re.search(r'playlist/([a-zA-Z0-9]+)', url).group(1)
-        
-        # Check the length first by parsing through the playlist embed
+
+        # Optimization: Parse the public playlist embed first.
+        # This allows us to fetch track metadata for small playlists (<= 99 tracks) 
+        # without requiring any Spotify API authentication or user login.
         embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-        
+
         async with aiohttp.ClientSession(headers=headers) as session:
             async with session.get(embed_url) as resp:
                 if resp.status != 200:
                     return web.json_response({"error": f"Spotify returned status {resp.status}"}, status=resp.status)
                 html = await resp.text()
-                
+
         match = re.search(r'<script id="__NEXT_DATA__" type="application/json">([^<]+)</script>', html)
         if not match:
             return web.json_response({"error": "Failed to parse Spotify metadata"}, status=500)
-            
+
         data = json.loads(match.group(1))
         entity = data.get('props', {}).get('pageProps', {}).get('state', {}).get('data', {}).get('entity', {})
         track_list = entity.get('trackList', [])
         playlist_name = entity.get('name', 'Unknown Spotify Playlist')
-        
+
         # Get playlist cover
         playlist_cover = ""
         sources = entity.get('coverArt', {}).get('sources', [])
         if sources:
             playlist_cover = sources[0].get('url', '')
-        
+
         tracks = []
         for t in track_list:
             c_sources = t.get("coverArt", {}).get("sources", [])
             t_cover = c_sources[0].get("url", playlist_cover) if c_sources else playlist_cover
-            
+
             tracks.append({
                 "title": clean_track_title(t.get("title", "Unknown")),
                 "artist": t.get("subtitle", "Unknown Artist"),
@@ -899,12 +921,12 @@ async def handle_spotify_playlist(url):
                 "id": t.get("uri", "").split(":")[-1]
             })
 
-        # If the length of the tracks are less than or equal to 99, move the tracks that were parsed to staging
+        # If the playlist is small, return the scraped tracks immediately
         if len(tracks) <= 99:
             return web.json_response({"tracks": tracks, "title": playlist_name})
 
-        # If the length is 100 (or more), call the previously wrapped function
-        # Check for Spotify API credentials in config
+        # If the playlist is large (100+ tracks), we MUST use the Spotify Web API 
+        # to fetch the full list, as the embed is limited to 100 items.
         content = read_config_raw()
         client_id = get_val_from_content(content, "client_id", "spotify")
         client_secret = get_val_from_content(content, "client_secret", "spotify")
@@ -914,18 +936,15 @@ async def handle_spotify_playlist(url):
         if client_id and client_secret:
             token_to_use = None
             if user_access_token:
-                # Try using user token first (unlimited tracks)
+                # Use the authenticated user token to bypass 100-track limits
                 token_to_use = user_access_token
                 add_log(f"Fetching playlist {playlist_id} using Spotify User Auth...")
-            
-            # If we have a token (or can get a client credentials one as fallback)
-            # handle_spotify_playlist_api now accepts an optional existing token
+
             return await handle_spotify_playlist_api(playlist_id, client_id, client_secret, token_to_use, user_refresh_token)
-        
-        # No Spotify API credentials, using scraped tracks
-        add_log(f"No Spotify API credentials, using scraper for {playlist_id}...")
-        return web.json_response({"tracks": tracks, "title": playlist_name})
-    except Exception as e:
+
+        # Fallback: if no credentials exist, we just return what we scraped from the embed
+        add_log(f"No Spotify API credentials, using scraped tracks for {playlist_id}...")
+        return web.json_response({"tracks": tracks, "title": playlist_name})    except Exception as e:
         logger.exception("Spotify playlist handling failed")
         return web.json_response({"error": f"Spotify error: {str(e)}"}, status=500)
 

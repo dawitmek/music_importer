@@ -138,10 +138,14 @@
           </div>
         </div>
         <div class="card">
-          <div class="card-title">Staging Area</div>
+          <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+            <span>Staging Area</span>
+            <button class="btn btn-ghost btn-sm" id="toggle-staging-expand" style="padding: 4px 8px; font-size: 11px;">⤢ Expand</button>
+          </div>
           <div class="staging" id="staging"><div class="staging-empty">No tracks staged — search and add songs above</div></div>
           <div class="staging-actions">
             <span class="staging-count" id="staging-count">0 tracks staged</span>
+            <button class="btn btn-ghost btn-sm" id="remove-selected" style="display:none; color: var(--rose);">🗑 Remove Selected</button>
             <button class="btn btn-ghost btn-sm" id="clear-staging">✕ Clear</button>
             <button class="btn btn-gold" id="sync-all">⚡ Sync All</button>
           </div>

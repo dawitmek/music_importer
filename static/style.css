@@ -824,6 +824,10 @@ body {
   min-height: 80px;
   max-height: 220px;
   overflow-y: auto;
+  transition: max-height 0.3s ease;
+}
+.staging.expanded {
+  max-height: 60vh;
 }
 .staging-empty {
   display: flex;
@@ -842,6 +846,17 @@ body {
   padding: 10px 14px;
   border-bottom: 1px solid var(--border);
   animation: slidein 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+.staging-item:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+.staging-item.selected {
+  background: rgba(108, 99, 255, 0.15);
+  padding-left: 11px;
+  border-left: 3px solid var(--blurple);
 }
 .staging-item:last-child {
   border-bottom: none;
