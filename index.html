@@ -15,12 +15,16 @@
 <div class="scanlines"></div>
 
 <div class="app">
+  <header class="mobile-header">
+    <div class="logo">
+      <div class="logo-title"><span class="logo-text-m">Music</span><span class="logo-text-v">Vault</span></div>
+    </div>
+  </header>
   <div class="main-area">
 
     <aside class="sidebar">
       <div class="logo">
-        <div class="logo-eyebrow">// system</div>
-        <div class="logo-title">Music<br>Vault</div>
+        <div class="logo-title"><span class="logo-text-m">Music</span><span class="logo-text-v">Vault</span></div>
         <div class="logo-sub">Music Library</div>
       </div>
       <nav class="nav">
@@ -155,6 +159,7 @@
             <div class="card-title" style="margin:0">Download Queue</div>
             <div style="display:flex;gap:8px">
               <button class="btn btn-ghost btn-sm" id="retry-failed-btn" style="color:var(--emerald)">↻ Retry Failed</button>
+              <button class="btn btn-ghost btn-sm" id="pause-queue-btn" style="color:var(--gold)">⏸ Pause Queue</button>
               <button class="btn btn-danger btn-sm" id="stop-queue-btn">Stop Queue</button>
               <button class="btn btn-ghost btn-sm" id="clear-queue-btn">Clear Queue</button>
             </div>
@@ -371,6 +376,34 @@
     </div>
   </div>
 </div>
+
+<!-- IMPORT MODE MODAL -->
+<div class="modal-overlay" id="import-mode-modal">
+  <div class="modal">
+    <div class="modal-title">Sync Multiple Playlists</div>
+    <div style="font-size: 14px; color: var(--text); margin-bottom: 20px; line-height: 1.5;">
+      You have tracks from multiple playlists staged. How would you like to download them?
+    </div>
+    
+    <div class="config-field">
+      <label class="config-label">Name for Combined Playlist</label>
+      <input type="text" class="config-input" id="combined-name-input" placeholder="e.g., Mixed Collection" autocomplete="off"/>
+      <div class="config-hint">Tracks from all staged playlists will be grouped here.</div>
+    </div>
+
+    <div class="modal-actions" style="flex-direction: column; gap: 10px; align-items: stretch; margin-top: 10px;">
+      <button class="btn btn-primary" id="mode-combine-btn" style="width: 100%; justify-content: center; font-size: 15px;">⚡ Merge into One Folder</button>
+      <div style="display: flex; align-items: center; gap: 10px; margin: 5px 0;">
+        <div style="flex: 1; height: 1px; background: var(--border);"></div>
+        <span style="font-size: 11px; color: var(--muted); font-family: 'JetBrains Mono', monospace;">OR</span>
+        <div style="flex: 1; height: 1px; background: var(--border);"></div>
+      </div>
+      <button class="btn btn-ghost" id="mode-separate-btn" style="width: 100%; justify-content: center; color: var(--cyan); border-color: var(--cyan-glow);">📁 Keep Original Playlists</button>
+      <button class="btn btn-text" id="close-import-modal-btn" style="margin-top: 10px;">Cancel Sync</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 <script src="/static/script.js?v=1.0.1"></script>
 </body>

@@ -102,6 +102,17 @@ function updateUI(s){
   if(dashBatchFill) dashBatchFill.style.width = `${batchPct}%`;
   if(dashBatchText) dashBatchText.textContent = `Batch: ${batchDone} / ${batchTotal}`;
 
+  const pauseBtn = document.getElementById('pause-queue-btn');
+  if(pauseBtn){
+    if(s.is_paused){
+      pauseBtn.innerHTML = '▶ Resume Queue';
+      pauseBtn.style.color = 'var(--emerald)';
+    } else {
+      pauseBtn.innerHTML = '⏸ Pause Queue';
+      pauseBtn.style.color = 'var(--gold)';
+    }
+  }
+
   if(document.getElementById('dash-done')) document.getElementById('dash-done').textContent = c.length;
   if(document.getElementById('dash-fail')) document.getElementById('dash-fail').textContent = f.length;
 
@@ -411,7 +422,13 @@ async function doPlaylistSearch(url){
             let added=0;
             const newlyAdded=[];
             tracks.forEach(t=>{
-                if(!stagingTracks.find(st=>st.title===t.title&&st.artist===t.artist)){
+                // Skip duplicates in staging (check artist + title)
+                const isDuplicate = stagingTracks.some(st => 
+                    st.title.toLowerCase() === t.title.toLowerCase() && 
+                    (st.artist || "").toLowerCase() === (t.artist || "").toLowerCase()
+                );
+                
+                if(!isDuplicate){
                     if (!isSingle) {
                         t.playlist_name = playlistTitle;
                     }
@@ -563,7 +580,11 @@ document.getElementById('add-manual').addEventListener('click',()=>{
 
 // ── Staging ──────────────────────────────
 function addToStaging(track){
-  if(stagingTracks.find(t=>t.title===track.title&&t.artist===track.artist)){toast('Already staged','info');return;}
+  const isDuplicate = stagingTracks.some(t => 
+    t.title.toLowerCase() === track.title.toLowerCase() && 
+    (t.artist || "").toLowerCase() === (track.artist || "").toLowerCase()
+  );
+  if(isDuplicate){toast('Already staged','info');return;}
   track.tempId = track.tempId || Math.random().toString(36).substring(7);
   stagingTracks.push(track);renderStaging();
   sugEl.classList.add('hidden');
@@ -709,22 +730,66 @@ document.getElementById('toggle-staging-expand').addEventListener('click', (e) =
     }
 });
 document.getElementById('clear-staging').addEventListener('click',()=>{stagingTracks=[];renderStaging();});
-document.getElementById('sync-all').addEventListener('click',async()=>{
+document.getElementById('sync-all').addEventListener('click', () => {
   if(!stagingTracks.length){toast('Nothing staged!','error');return;}
-  try{
-    const r=await fetch('/api/download/playlist',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({tracks:stagingTracks.map(t=>({
-          title:t.title,
-          artist:t.artist,
-          deezer_id:t.id,
-          cover:t.cover,
-          playlist_name:t.playlist_name
-      }))})});
-    const data=await r.json();
+  
+  // Detect multiple playlists
+  const uniquePlaylists = [...new Set(stagingTracks.map(t => t.playlist_name).filter(Boolean))];
+  
+  if (uniquePlaylists.length > 1) {
+    // Show modal
+    openModal('import-mode-modal');
+    const input = document.getElementById('combined-name-input');
+    input.value = `Combined Import ${new Date().toLocaleDateString()}`;
+    setTimeout(() => {
+        input.focus();
+        input.select();
+    }, 100);
+  } else {
+    // Single playlist or just tracks — proceed as normal
+    performSync();
+  }
+});
+
+async function performSync(overridePlaylistName = null) {
+  try {
+    const r = await fetch('/api/download/playlist', {
+      method: 'POST', 
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        tracks: stagingTracks.map(t => ({
+          title: t.title,
+          artist: t.artist,
+          deezer_id: t.id,
+          cover: t.cover,
+          playlist_name: overridePlaylistName || t.playlist_name
+        }))
+      })
+    });
+    const data = await r.json();
     const skippedMsg = data.skipped > 0 ? `, ${data.skipped} already downloaded` : '';
-    toast(`Queued ${data.count} tracks${skippedMsg}`,'success');
-    stagingTracks=[];renderStaging();
-  }catch{toast('Failed to queue tracks','error');}
+    toast(`Queued ${data.count} tracks${skippedMsg}`, 'success');
+    stagingTracks = []; 
+    renderStaging();
+  } catch { 
+    toast('Failed to queue tracks', 'error'); 
+  }
+}
+
+// Modal Handlers
+document.getElementById('mode-combine-btn').addEventListener('click', () => {
+    const combinedName = document.getElementById('combined-name-input').value.trim() || 'Combined Import';
+    performSync(combinedName);
+    closeModal('import-mode-modal');
+});
+
+document.getElementById('mode-separate-btn').addEventListener('click', () => {
+    performSync();
+    closeModal('import-mode-modal');
+});
+
+document.getElementById('close-import-modal-btn').addEventListener('click', () => {
+    closeModal('import-mode-modal');
 });
 document.getElementById('clear-queue-btn').addEventListener('click',async()=>{
   await fetch('/api/download/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})});
@@ -733,6 +798,9 @@ document.getElementById('clear-queue-btn').addEventListener('click',async()=>{
 document.getElementById('stop-queue-btn').addEventListener('click',async()=>{
   await fetch('/api/download/stop',{method:'POST',headers:{'Content-Type':'application/json'}});
   toast('Queue and active downloads stopped','info');
+});
+document.getElementById('pause-queue-btn').addEventListener('click',async()=>{
+  await fetch('/api/download/pause',{method:'POST',headers:{'Content-Type':'application/json'}});
 });
 document.getElementById('retry-failed-btn').addEventListener('click',async()=>{
     // We can either add a new endpoint for 'retry-all' or just call retry for each
@@ -878,6 +946,12 @@ function renderFiles(items){
     const isImage=['.jpg','.jpeg','.png','.webp','.gif'].includes(f.ext);
     
     let iconHTML = isDir ? '📁' : getFileIcon(f.ext);
+    if(isDir && f.has_cover) {
+        const thumbSize = layoutClass === 'list-layout' ? '44px' : '80px';
+        iconHTML = `<div style="width:${thumbSize};height:${thumbSize};display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:var(--radius);background:var(--bg)">
+                      <img src="/api/track-cover?folder=${enc(f.path)}" style="width:100%;height:100%;object-fit:cover;" onerror="this.outerHTML='📁'"/>
+                    </div>`;
+    }
     if(isImage) {
         const thumbSize = layoutClass === 'list-layout' ? '44px' : '80px';
         iconHTML = `<div style="width:${thumbSize};height:${thumbSize};display:flex;align-items:center;justify-content:center;overflow:hidden;border-radius:var(--radius);background:var(--bg)">
@@ -1027,6 +1101,11 @@ function playFile(path,name,e){
   e&&e.stopPropagation();
   const audio=document.getElementById('audio-el');
   audio.src=`/files/${urlEnc(path)}`;audio.play();
+  
+  // Show the player
+  const app = document.querySelector('.app');
+  if(app) app.classList.add('player-visible');
+
   document.getElementById('player-title').textContent=decodeURIComponent(name.replace(/\.[^.]+$/,''));
   document.getElementById('player-artist').textContent='—';
   document.getElementById('play-btn').innerHTML='⏸';
@@ -1170,6 +1249,11 @@ function showTab(name){
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   document.getElementById(`tab-${name}`).classList.add('active');
   document.querySelector(`[data-tab="${name}"]`).classList.add('active');
+  
+  // Scroll content area to top on tab switch (good for mobile)
+  const content = document.querySelector('.content');
+  if(content) content.scrollTop = 0;
+
   if(name==='files')loadFiles();
   if(name==='config')loadConfig();
   if(name==='logs'){

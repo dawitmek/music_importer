@@ -264,6 +264,7 @@ DOWNLOAD_STATUS: dict = {
     "batch_completed": 0,
     "last_batch_finished_at": None,
     "library_size": 0,
+    "is_paused": False,
 }
 
 DEEZER_MAX_QUALITY = None  # Persistent memory for account capability (0, 1, 2, 3)
@@ -736,7 +737,8 @@ async def queue_worker():
         async with DOWNLOAD_LOCK:
             queue = DOWNLOAD_STATUS["queue"]
             active = DOWNLOAD_STATUS["active"]
-            if queue and len(active) < 3:
+            is_paused = DOWNLOAD_STATUS.get("is_paused", False)
+            if queue and len(active) < 3 and not is_paused:
                 item = queue.pop(0)
                 item["status"] = "downloading"
                 item["started_at"] = time.time()
@@ -1254,9 +1256,20 @@ async def stop_downloads(request):
         DOWNLOAD_STATUS["active"] = []
         DOWNLOAD_STATUS["batch_total"] = 0
         DOWNLOAD_STATUS["batch_completed"] = 0
+        DOWNLOAD_STATUS["is_paused"] = False
         save_status()
     await broadcast()
     return web.json_response({"ok": True})
+
+
+async def toggle_pause(request):
+    async with DOWNLOAD_LOCK:
+        DOWNLOAD_STATUS["is_paused"] = not DOWNLOAD_STATUS.get("is_paused", False)
+        state = "paused" if DOWNLOAD_STATUS["is_paused"] else "resumed"
+        add_log(f"Queue {state}")
+        save_status()
+    await broadcast()
+    return web.json_response({"ok": True, "is_paused": DOWNLOAD_STATUS["is_paused"]})
 
 
 async def retry_track(request):
@@ -1297,10 +1310,15 @@ async def track_cover(request):
     if folder:
         # folder is relative to DOWNLOADS_DIR
         base = DOWNLOADS_DIR / folder
+        found_local = False
         for name in ["cover.jpg", "cover.png", "folder.jpg", "folder.png"]:
             p = base / name
             if p.exists():
                 return web.FileResponse(p)
+        
+        # If folder was specified but no local cover found, return 404 
+        # so frontend can fall back to generic icon
+        return web.Response(status=404)
 
     # 2. Fetch from Deezer (async, cached)
     if artist or title:
@@ -1345,6 +1363,14 @@ async def list_files(request):
         for entry in sorted(target.iterdir(), key=lambda e: (e.is_file(), e.name.lower())):
             stat = entry.stat()
             rel_path = str(entry.relative_to(DOWNLOADS_DIR))
+            
+            has_cover = False
+            if entry.is_dir():
+                for name in ["cover.jpg", "cover.png", "folder.jpg", "folder.png"]:
+                    if (entry / name).exists():
+                        has_cover = True
+                        break
+
             items.append({
                 "name": entry.name,
                 "type": "file" if entry.is_file() else "dir",
@@ -1352,6 +1378,7 @@ async def list_files(request):
                 "modified": stat.st_mtime,
                 "ext": entry.suffix.lower() if entry.is_file() else "",
                 "path": rel_path,
+                "has_cover": has_cover,
             })
     except PermissionError:
         pass
@@ -1666,6 +1693,7 @@ def create_app():
     app.router.add_post("/api/download/check", check_downloaded)
     app.router.add_post("/api/download/clear", clear_queue)
     app.router.add_post("/api/download/stop", stop_downloads)
+    app.router.add_post("/api/download/pause", toggle_pause)
     app.router.add_post("/api/download/retry", retry_track)
     app.router.add_post("/api/download/remove", remove_from_queue)
     app.router.add_get("/api/track-cover", track_cover)
