@@ -60,6 +60,9 @@ let viewMode = 'auto'; // 'auto', 'grid', 'list'
 let coverQueue = [];
 let activeCoverFetches = 0;
 const COVER_CONCURRENCY = 5;
+const QUEUE_RENDER_LIMIT = 50;
+let lastQueueSig = null;
+let renderedLogSeq = -1;   // highest log `seq` already in the DOM
 
 // ── WebSocket ────────────────────────────
 function connectWS(){
@@ -85,6 +88,18 @@ function connectWS(){
       }
     }
   };
+}
+
+// Fetches that 401 when MV_AUTH_TOKEN is set need to say so once, rather than
+// failing silently all over the UI
+let authWarned=false;
+async function api(url, opts){
+  const r=await fetch(url, opts);
+  if(r.status===401 && !authWarned){
+    authWarned=true;
+    toast('Not authorized — reopen this page as /?token=YOUR_TOKEN','error');
+  }
+  return r;
 }
 
 // Global queue bar — mirrors the Download Queue card's controls on every tab.
@@ -156,7 +171,10 @@ function updateUI(s){
     }
   }
 
-  if(document.getElementById('dash-done')) document.getElementById('dash-done').textContent = c.length;
+  // The server only sends the tail of the completed list now, so use its
+  // running total for the counter
+  const doneCount = s.completed_total != null ? s.completed_total : c.length;
+  if(document.getElementById('dash-done')) document.getElementById('dash-done').textContent = doneCount;
   if(document.getElementById('dash-fail')) document.getElementById('dash-fail').textContent = f.length;
 
   const lastCompleteEl = document.getElementById('dash-last-complete');
@@ -227,22 +245,31 @@ function updateUI(s){
     ...c.slice(-10).reverse().map(x=>({...x,_cat:'done'}))
   ];
   const ql=document.getElementById('queue-list');
+
+  // A 500-track import rebuilt 500 nodes on every status tick. Cap what we draw
+  // and skip the rebuild entirely when nothing visible changed.
+  const shown = all.slice(0, QUEUE_RENDER_LIMIT);
+  const sig = shown.map(x=>`${x.id}:${x.status||x._cat}`).join('|') + `#${all.length}`;
+  if(sig === lastQueueSig){ updateLogs(s.logs||[]); return; }
+  lastQueueSig = sig;
+
   ql.innerHTML = '';
-  
+
   if(!all.length){
     ql.innerHTML=`<div style="color:var(--dim);font-size:12px;padding:14px;font-family:'JetBrains Mono',monospace;letter-spacing:1px">— queue is empty —</div>`;
+    updateLogs(s.logs||[]);
     return;
   }
 
-  all.forEach((item, idx) => {
+  shown.forEach((item, idx) => {
     const status=item.status||(item._cat==='done'?'completed':item._cat==='fail'?'failed':'pending');
     const prog=status==='downloading'?`<div class="q-progress"><div class="q-progress-bar"></div></div>`:'';
-    
+
     const qItem = document.createElement('div');
     qItem.className = `queue-item ${status}`;
     qItem.style.animationDelay = `${idx*.04}s`;
     qItem.innerHTML = `
-      <img class="q-cover" src="${item.cover || `/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}`}" onerror="this.src='/api/track-cover'" loading="lazy"/>
+      <img class="q-cover" src="${esc(item.cover || '') || `/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}`}" onerror="this.src='/api/track-cover'" loading="lazy"/>
       <div class="q-info"><div class="q-title">${esc(item.title)}</div><div class="q-artist">${esc(item.artist||'—')}</div>${prog}</div>
       <span class="q-status ${status}">${status}</span>
       <div class="q-actions"></div>
@@ -267,6 +294,13 @@ function updateUI(s){
 
     ql.appendChild(qItem);
   });
+
+  if(all.length > shown.length){
+    const more = document.createElement('div');
+    more.style.cssText = "color:var(--dim);font-size:12px;padding:10px 14px;font-family:'JetBrains Mono',monospace;letter-spacing:1px";
+    more.textContent = `— ${all.length - shown.length} more queued —`;
+    ql.appendChild(more);
+  }
   updateLogs(s.logs||[]);
 }
 
@@ -290,7 +324,7 @@ function renderFailed(failed){
       ? new Date(item.finished_at*1000).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'})
       : '';
     el.innerHTML = `
-      <img class="q-cover" src="${item.cover || `/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}`}" onerror="this.src='/api/track-cover'" loading="lazy"/>
+      <img class="q-cover" src="${esc(item.cover || '') || `/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}`}" onerror="this.src='/api/track-cover'" loading="lazy"/>
       <div class="q-info"><div class="q-title">${esc(item.title)}</div><div class="q-artist">${esc(item.artist||'—')}</div></div>
       <span class="q-failed-time">${when}</span>
       <div class="q-actions"></div>
@@ -317,7 +351,7 @@ function renderFailed(failed){
 
 async function removeFromQueue(id){
   try{
-    const r=await fetch('/api/download/remove',{
+    const r=await api('/api/download/remove',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({id})
@@ -327,26 +361,36 @@ async function removeFromQueue(id){
   }catch(e){ toast('Failed to remove track','error'); }
 }
 
-function animNum(id,v){
-  const el=document.getElementById(id);if(!el)return;
-  if(parseInt(el.textContent)===v)return;
-  el.textContent=v;
-  el.style.transition='transform .2s cubic-bezier(.4,0,.2,1)';
-  el.style.transform='scale(1.2)';
-  setTimeout(()=>{el.style.transform='';},200);
-}
+const MAX_LOG_LINES = 500;
 
+// Append only the lines we haven't drawn yet. Re-rendering all 500 on every
+// status tick was a full innerHTML rebuild several times a second.
 function updateLogs(logs){
   const c=document.getElementById('log-container');
-  if(!c) return;
+  if(!c || !logs.length) return;
   const isVisible = c.offsetParent !== null;
-  
-  c.innerHTML=logs.map(l=>{
+
+  const fresh = logs.filter(l => (l.seq == null) || l.seq > renderedLogSeq);
+  if(!fresh.length) return;
+
+  // A server restart resets the sequence — start the panel over
+  if(fresh.length === logs.length && renderedLogSeq > 0 && logs[0].seq === 1){
+    c.innerHTML = '';
+  }
+
+  const frag = document.createDocumentFragment();
+  fresh.forEach(l => {
     const d=new Date(l.ts*1000);
     const ts=d.toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});
-    return `<div class="log-line"><span class="ts">${ts}</span><span class="level ${l.level}">${l.level}</span><span class="msg">${esc(l.msg)}</span></div>`;
-  }).join('');
-  
+    const line = document.createElement('div');
+    line.className = 'log-line';
+    line.innerHTML = `<span class="ts">${ts}</span><span class="level ${esc(l.level)}">${esc(l.level)}</span><span class="msg">${esc(l.msg)}</span>`;
+    frag.appendChild(line);
+    if(l.seq != null && l.seq > renderedLogSeq) renderedLogSeq = l.seq;
+  });
+  c.appendChild(frag);
+
+  while(c.childElementCount > MAX_LOG_LINES) c.removeChild(c.firstElementChild);
   if(autoScroll && isVisible) c.scrollTop=c.scrollHeight;
 }
 
@@ -470,7 +514,7 @@ function handleSearchSubmit(){
 async function doSearch(q){
   if(!q || q.startsWith('http'))return;
   try{
-    const r=await fetch(`/api/search/suggestions?q=${enc(q)}`);
+    const r=await api(`/api/search/suggestions?q=${enc(q)}`);
     renderSug(await r.json());
   }catch{toast('Search failed','error');}
 }
@@ -479,7 +523,7 @@ async function doPlaylistSearch(url){
     console.log('Searching playlist:', url);
     statusEl.textContent='Fetching playlist metadata...';
     try{
-        const r=await fetch('/api/search/playlist',{
+        const r=await api('/api/search/playlist',{
             method:'POST',
             headers:{'Content-Type':'application/json'},
             body:JSON.stringify({url})
@@ -563,18 +607,21 @@ function pumpCoverQueue() {
 async function fetchOneCover(track) {
     if (track.coverRetries === undefined) track.coverRetries = 0;
     try {
-        const r = await fetch(`/api/track-cover?artist=${enc(track.artist)}&title=${enc(track.title)}`);
+        const r = await api(`/api/track-cover?artist=${enc(track.artist)}&title=${enc(track.title)}`);
         if (r.ok) {
             const staged = stagingTracks.find(st => st.tempId === track.tempId);
             if (staged) {
                 const blob = await r.blob();
-                if (staged.cover && staged.cover.startsWith('blob:')) URL.revokeObjectURL(staged.cover);
-                staged.cover = URL.createObjectURL(blob);
-                
+                // Held on `coverBlob`, never on `cover`: object URLs are only
+                // valid in this tab, and `cover` gets persisted to the server
+                // and forwarded into the download queue.
+                if (staged.coverBlob) URL.revokeObjectURL(staged.coverBlob);
+                staged.coverBlob = URL.createObjectURL(blob);
+
                 // Directly update the image element if it exists in the DOM to avoid re-rendering everything
                 const imgEl = document.getElementById(`cover-${track.tempId}`);
                 if (imgEl) {
-                    imgEl.src = staged.cover;
+                    imgEl.src = staged.coverBlob;
                 }
             }
         } else {
@@ -658,17 +705,77 @@ function setActiveMode(mode){
   });
 }
 
-document.getElementById('add-manual').addEventListener('click',()=>{
+// Manual entries are typed freehand, so the casing and spelling are whatever the
+// user happened to use. Look the track up and stage Deezer's listing instead —
+// that also gets us the real cover art, album, and a Deezer id to download from.
+function normForMatch(s){
+  return (s||'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+}
+function looksLikeSameTrack(typed, found){
+  const t=normForMatch(typed), f=normForMatch(found);
+  if(!t) return true;               // nothing typed to contradict the match
+  return f.includes(t) || t.includes(f);
+}
+async function canonicalizeManual(artist, title){
+  try{
+    const r=await api(`/api/search/suggestions?q=${enc(`${artist} ${title}`.trim())}`);
+    const hit=(await r.json() || [])[0];
+    // Only accept the lookup if it plausibly matches what was typed, so a bad
+    // search never silently swaps in a different song
+    if(hit && looksLikeSameTrack(title, hit.title) && looksLikeSameTrack(artist, hit.artist)) return hit;
+  }catch(e){ /* offline or search failed — fall back to the typed text */ }
+  return null;
+}
+
+document.getElementById('add-manual').addEventListener('click',async()=>{
   const artist=document.getElementById('m-artist').value.trim();
   const title=document.getElementById('m-title').value.trim();
   if(!title){toast('Please enter a title','error');return;}
-  const track = {title,artist,cover:''};
+
+  const btn=document.getElementById('add-manual');
+  btn.disabled=true;
+  const match=await canonicalizeManual(artist,title);
+  btn.disabled=false;
+
+  const track = match
+    ? {id:match.id, title:match.title, artist:match.artist, album:match.album, duration:match.duration, cover:match.cover}
+    : {title,artist,cover:''};
+  if(match && (match.title!==title || match.artist!==artist)){
+    toast(`Matched: ${match.artist} — ${match.title}`,'info');
+  }
   addToStaging(track);
   saveToHistory('manual', track);
   document.getElementById('m-artist').value='';document.getElementById('m-title').value='';
 });
 
 // ── Staging ──────────────────────────────
+// The staging area lives on the server (data/staging.json), so it survives page
+// reloads, restarts, and follows the user between browsers.
+let stagingSaveTimer=null, stagingLoaded=false;
+function saveStaging(){
+  if(!stagingLoaded) return;   // don't overwrite the server before the initial load lands
+  clearTimeout(stagingSaveTimer);
+  stagingSaveTimer=setTimeout(()=>{
+    // `selected` and `coverBlob` are transient UI state — a blob: URL is only
+    // valid in this tab, so persisting it would store a dead reference
+    const tracks=stagingTracks.map(({selected, coverBlob, ...t}) => t);
+    api('/api/staging',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({tracks})
+    }).catch(()=>{});
+  },400);
+}
+async function loadStaging(){
+  try{
+    const r=await api('/api/staging');
+    const tracks=await r.json();
+    if(Array.isArray(tracks)) stagingTracks=tracks;
+  }catch(e){ /* server unreachable — start with an empty staging area */ }
+  stagingLoaded=true;
+  renderStaging();
+}
+
 function addToStaging(track){
   const isDuplicate = stagingTracks.some(t => 
     t.title.toLowerCase() === track.title.toLowerCase() && 
@@ -685,7 +792,7 @@ function addToStaging(track){
 
 async function checkDownloadedStatus(tracks) {
     try {
-        const r = await fetch('/api/download/check', {
+        const r = await api('/api/download/check', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({tracks: tracks.map(t => ({title: t.title, artist: t.artist, playlist_name: t.playlist_name || null}))})
@@ -707,7 +814,7 @@ async function checkDownloadedStatus(tracks) {
 
 async function retryTrack(id){
     try{
-        const r = await fetch('/api/download/retry', {
+        const r = await api('/api/download/retry', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({id})
@@ -720,6 +827,10 @@ async function retryTrack(id){
 let lastSelectedIdx = null;
 
 function renderStaging(){
+  // Every staging mutation funnels through here, so this is the one place that
+  // needs to sync. Must run before the empty-list early return below, otherwise
+  // clearing the staging area would never persist.
+  saveStaging();
   const el=document.getElementById('staging');
   const cnt=document.getElementById('staging-count');
   cnt.textContent=`${stagingTracks.length} track${stagingTracks.length!==1?'s':''} staged`;
@@ -740,7 +851,7 @@ function renderStaging(){
       item.className = 'staging-item' + (t.alreadyDownloaded ? ' already-downloaded' : '') + (t.selected ? ' selected' : '');
       const badge = t.alreadyDownloaded ? `<span class="staging-badge-downloaded" title="Already downloaded">✓ downloaded</span>` : '';
       item.innerHTML = `
-        <img id="cover-${t.tempId}" class="staging-cover" src="${esc(t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
+        <img id="cover-${t.tempId}" class="staging-cover" src="${esc(t.coverBlob||t.cover||'')}" onerror="this.src='/api/track-cover?artist=${enc(t.artist)}&title=${enc(t.title)}'" loading="lazy"/>
         <div style="flex:1;min-width:0"><div class="staging-title">${esc(t.title)}</div><div class="staging-artist">${esc(t.artist||'—')}</div></div>
         ${badge}
         <button class="staging-remove">✕</button>
@@ -800,12 +911,16 @@ function updateStagingSelectionUI() {
     removeSelectedBtn.style.display = hasSelected ? 'inline-block' : 'none';
 }
 
+function revokeCovers(tracks){
+    tracks.forEach(t => { if(t.coverBlob) URL.revokeObjectURL(t.coverBlob); });
+}
 function removeStaging(i){
-    stagingTracks.splice(i,1);
+    revokeCovers(stagingTracks.splice(i,1));
     lastSelectedIdx = null;
     renderStaging();
 }
 document.getElementById('remove-selected').addEventListener('click', () => {
+    revokeCovers(stagingTracks.filter(t => t.selected));
     stagingTracks = stagingTracks.filter(t => !t.selected);
     lastSelectedIdx = null;
     renderStaging();
@@ -819,7 +934,7 @@ document.getElementById('toggle-staging-expand').addEventListener('click', (e) =
         e.target.textContent = '⤢ Expand';
     }
 });
-document.getElementById('clear-staging').addEventListener('click',()=>{stagingTracks=[];renderStaging();});
+document.getElementById('clear-staging').addEventListener('click',()=>{revokeCovers(stagingTracks);stagingTracks=[];renderStaging();});
 document.getElementById('sync-all').addEventListener('click', () => {
   if(!stagingTracks.length){toast('Nothing staged!','error');return;}
   
@@ -843,7 +958,7 @@ document.getElementById('sync-all').addEventListener('click', () => {
 
 async function performSync(overridePlaylistName = null) {
   try {
-    const r = await fetch('/api/download/playlist', {
+    const r = await api('/api/download/playlist', {
       method: 'POST', 
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
@@ -851,7 +966,7 @@ async function performSync(overridePlaylistName = null) {
           title: t.title,
           artist: t.artist,
           deezer_id: t.id,
-          cover: t.cover,
+          cover: (t.cover && !t.cover.startsWith('blob:')) ? t.cover : '',
           playlist_name: overridePlaylistName || t.playlist_name
         }))
       })
@@ -859,6 +974,7 @@ async function performSync(overridePlaylistName = null) {
     const data = await r.json();
     const skippedMsg = data.skipped > 0 ? `, ${data.skipped} already downloaded` : '';
     toast(`Queued ${data.count} tracks${skippedMsg}`, 'success');
+    revokeCovers(stagingTracks);
     stagingTracks = []; 
     renderStaging();
   } catch { 
@@ -883,28 +999,28 @@ document.getElementById('close-import-modal-btn').addEventListener('click', () =
 });
 // Queue actions are shared by the Download Queue card and the global queue bar
 async function queueClear(){
-  await fetch('/api/download/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})});
+  await api('/api/download/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})});
   toast('Queue cleared','info');
 }
 async function queueStop(){
-  await fetch('/api/download/stop',{method:'POST',headers:{'Content-Type':'application/json'}});
+  await api('/api/download/stop',{method:'POST',headers:{'Content-Type':'application/json'}});
   toast('Queue and active downloads stopped','info');
 }
 async function queueTogglePause(){
-  await fetch('/api/download/pause',{method:'POST',headers:{'Content-Type':'application/json'}});
+  await api('/api/download/pause',{method:'POST',headers:{'Content-Type':'application/json'}});
 }
 async function queueRetryFailed(){
-    // We can either add a new endpoint for 'retry-all' or just call retry for each
     const failedItems = wsStatus.failed || [];
     if(!failedItems.length) { toast('No failed tracks to retry', 'info'); return; }
-    for(const item of failedItems){
-        await fetch('/api/download/retry', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({id: item.id})
-        });
-    }
-    toast(`Retrying ${failedItems.length} tracks`, 'info');
+    // One request instead of one per track — each used to trigger its own
+    // status write and full broadcast
+    const r = await api('/api/download/retry', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({all: true})
+    });
+    const data = await r.json().catch(()=>({}));
+    toast(`Retrying ${data.count != null ? data.count : failedItems.length} tracks`, 'info');
 }
 document.getElementById('clear-queue-btn').addEventListener('click',queueClear);
 document.getElementById('stop-queue-btn').addEventListener('click',queueStop);
@@ -916,7 +1032,7 @@ document.getElementById('qb-pause').addEventListener('click',queueTogglePause);
 document.getElementById('qb-retry').addEventListener('click',queueRetryFailed);
 document.getElementById('retry-all-failed-btn').addEventListener('click',queueRetryFailed);
 document.getElementById('clear-failed-btn').addEventListener('click',async()=>{
-  await fetch('/api/download/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({failed:true})});
+  await api('/api/download/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({failed:true})});
   toast('Failed list cleared','info');
 });
 
@@ -925,7 +1041,7 @@ async function loadFiles(path=currentPath){
   currentPath=path;updateBreadcrumb(path);
   clearSelection();
   try{
-    const r=await fetch(`/api/files?path=${enc(path)}`);
+    const r=await api(`/api/files?path=${enc(path)}`);
     const data=await r.json();
     updateDashboardDisk(data);
     currentItems = data.items || [];
@@ -1233,19 +1349,19 @@ async function renameFile(path,name,e){
   document.getElementById('rename-input').value=name;openModal('rename-modal');
   document.getElementById('rename-confirm').onclick=async()=>{
     const n=document.getElementById('rename-input').value.trim();if(!n)return;
-    await fetch('/api/files/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,new_name:n})});
+    await api('/api/files/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path,new_name:n})});
     closeModal('rename-modal');toast('Renamed!','success');loadFiles();
   };
 }
 async function deleteFile(path,e){
   e&&e.stopPropagation();
   if(!confirm(`Delete "${path.split('/').pop()}"?`))return;
-  await fetch('/api/files/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
+  await api('/api/files/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
   toast('Deleted','info');loadFiles();
 }
 async function zipFolder(path,e){
   e&&e.stopPropagation();toast('Creating zip…','info');
-  const r=await fetch('/api/files/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
+  const r=await api('/api/files/zip',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
   const data=await r.json();
   if(data.ok){toast('Zip ready!','success');const a=document.createElement('a');a.href=`/files/${data.zip_path}`;a.download=data.zip_path.split('/').pop();a.click();}
 }
@@ -1290,13 +1406,26 @@ volSlider.addEventListener('input',()=>{
 audio.volume=.8;
 
 // ── Config ────────────────────────────────
+// The server returns stored credentials masked rather than in the clear. We
+// post the mask straight back when the user hasn't retyped it, and the server
+// keeps whatever it already has.
+const SECRET_MASK = '••••••••';
+
 async function loadConfig(){
-  const r=await fetch('/api/config');const cfg=await r.json();
+  const r=await api('/api/config');
+  if(!r.ok) return;
+  const cfg=await r.json();
+
+  if(cfg.config_readable === false){
+    toast('Settings could not be decrypted — see the logs before saving','error');
+    if(cfg.config_error) console.error(cfg.config_error);
+  }
+
   document.getElementById('cfg-arl').value=cfg.arl||'';
   document.getElementById('cfg-quality').value=cfg.quality||'MP3_320';
   document.getElementById('cfg-spotify-id').value=cfg.spotify_id||'';
   document.getElementById('cfg-spotify-secret').value=cfg.spotify_secret||'';
-  
+
   if(cfg.spotify_redirect) document.getElementById('cfg-spotify-redirect').value = cfg.spotify_redirect;
 
   // Update the display-only redirect URI
@@ -1317,6 +1446,12 @@ async function loadConfig(){
       const yt = document.getElementById('dep-ytdlp');
       if(sr) sr.innerHTML = `streamrip: <span style="color:${cfg.deps.streamrip ? 'var(--emerald)' : 'var(--rose)'}">${cfg.deps.streamrip ? 'INSTALLED' : 'MISSING'}</span>`;
       if(yt) yt.innerHTML = `yt-dlp: <span style="color:${cfg.deps.ytdlp ? 'var(--emerald)' : 'var(--rose)'}">${cfg.deps.ytdlp ? 'INSTALLED' : 'MISSING'}</span>`;
+      const sec = document.getElementById('dep-security');
+      if(sec){
+        const strong = cfg.deps.encryption === 'fernet';
+        sec.innerHTML = `config: <span style="color:${strong ? 'var(--emerald)' : 'var(--amber)'}">${strong ? 'ENCRYPTED' : 'OBFUSCATED ONLY'}</span>`
+                      + ` · auth: <span style="color:${cfg.auth_enabled ? 'var(--emerald)' : 'var(--amber)'}">${cfg.auth_enabled ? 'ON' : 'OFF'}</span>`;
+      }
   }
   if(cfg.download_path){
       const dp = document.getElementById('cfg-dl-path');
@@ -1330,12 +1465,18 @@ document.getElementById('save-config-btn').addEventListener('click',async()=>{
   const spotify_secret=document.getElementById('cfg-spotify-secret').value.trim();
   const spotify_redirect=document.getElementById('cfg-spotify-redirect').value.trim();
   
-  await fetch('/api/config',{
+  const r=await api('/api/config',{
     method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({arl,quality,spotify_id,spotify_secret,spotify_redirect})
   });
+  if(!r.ok){
+    const data=await r.json().catch(()=>({}));
+    toast(data.error || 'Failed to save configuration','error');
+    return;
+  }
   toast('Configuration saved!','success');
+  loadConfig();   // re-mask the inputs
 });
 
 document.getElementById('spotify-login-btn').addEventListener('click',()=>{
@@ -1367,7 +1508,10 @@ function showTab(name){
 }
 document.querySelectorAll('.nav-item').forEach(item=>item.addEventListener('click',()=>showTab(item.dataset.tab)));
 
-document.getElementById('clear-logs-btn').addEventListener('click',()=>document.getElementById('log-container').innerHTML='');
+document.getElementById('clear-logs-btn').addEventListener('click',()=>{
+  document.getElementById('log-container').innerHTML='';
+  renderedLogSeq = wsStatus.logs && wsStatus.logs.length ? wsStatus.logs[wsStatus.logs.length-1].seq : -1;
+});
 document.getElementById('auto-scroll-btn').addEventListener('click',function(){
   autoScroll=!autoScroll;
   this.textContent=autoScroll?'⬇ Auto-scroll ON':'⬇ Auto-scroll OFF';
@@ -1407,7 +1551,7 @@ document.getElementById('refresh-files-btn').addEventListener('click', () => loa
 document.getElementById('select-all-btn').addEventListener('click', () => toggleSelectAll());
 document.getElementById('close-image-modal-btn').addEventListener('click', () => closeModal('image-modal'));
 document.getElementById('close-rename-modal-btn').addEventListener('click', () => closeModal('rename-modal'));
-connectWS();loadConfig();loadFiles('');
+connectWS();loadConfig();loadFiles('');loadStaging();
 
 document.getElementById('batch-cancel').addEventListener('click', clearSelection);
 
@@ -1418,7 +1562,7 @@ document.getElementById('batch-delete').addEventListener('click', async () => {
     toast(`Deleting ${selectedFiles.size} items...`, 'info');
     const items = Array.from(selectedFiles);
     for(const path of items){
-        await fetch('/api/files/delete', {
+        await api('/api/files/delete', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({path})
@@ -1433,7 +1577,7 @@ document.getElementById('batch-zip').addEventListener('click', async () => {
     toast('Creating batch zip...', 'info');
     
     try {
-        const r = await fetch('/api/files/zip/batch', {
+        const r = await api('/api/files/zip/batch', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({paths: Array.from(selectedFiles)})

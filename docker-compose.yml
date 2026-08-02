@@ -10,6 +10,11 @@ services:
       - ./config:/app/config
     environment:
       - PYTHONUNBUFFERED=1
+      # Refresh yt-dlp on container start (set to 0 to pin the built-in version)
+      - MV_UPDATE_YTDLP=1
+      # Set a value to require a shared token on every request. Strongly
+      # recommended if this port is reachable beyond localhost.
+      # - MV_AUTH_TOKEN=change-me
     command: python server.py
     restart: unless-stopped
     healthcheck:

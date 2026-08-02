@@ -1,0 +1,14 @@
+# Keep the build context small and keep secrets out of it.
+# The library alone is multiple GB; config/ holds the vault key and ARL.
+.venv/
+__pycache__/
+*.pyc
+
+downloads/
+data/
+config/
+
+.git/
+.gitignore
+*.log
+README.md

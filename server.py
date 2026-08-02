@@ -3,15 +3,18 @@
 
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
-import subprocess
 import time
 import uuid
 import zipfile
+from collections import OrderedDict
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -19,7 +22,6 @@ from datetime import datetime
 import requests
 from aiohttp import web, WSMsgType
 import aiohttp
-import aiofiles
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 # Resolve BASE_DIR: walk up from server.py until we find the project root
@@ -37,6 +39,7 @@ DATA_DIR = BASE_DIR / "data"
 CONFIG_DIR = BASE_DIR / "config"
 LOGS_DIR = DATA_DIR / "logs"
 STATUS_FILE = DATA_DIR / "status.json"
+STAGING_FILE = DATA_DIR / "staging.json"
 SONGS_FILE = DATA_DIR / "extracted_songs.json"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 # index.html may sit at root (flat) or inside frontend/ (nested)
@@ -58,100 +61,211 @@ logging.basicConfig(
 )
 logger = logging.getLogger("musicvault")
 
+# ── File helpers ─────────────────────────────────────────────────────────────
+def atomic_write(path: Path, text: str):
+    """Write via a temp file + rename, so a crash mid-write can't leave a
+    truncated file behind. status.json is rewritten constantly and start.sh
+    kills the server with SIGKILL, which made this a real risk."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def chmod_private(path: Path):
+    """Best-effort 0600. These files hold account credentials."""
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
 # ── Encryption Helper ────────────────────────────────────────────────────────
+# Config at rest is encrypted with the vault key. When `cryptography` is
+# installed we use Fernet (AES-128-CBC + HMAC); otherwise we fall back to the
+# legacy repeating-key XOR, which is obfuscation rather than encryption — it is
+# trivially recovered given known plaintext like `[deezer]`. Ciphertext carries
+# a prefix naming the scheme that wrote it so both can always be read back.
+try:
+    from cryptography.fernet import Fernet
+    HAVE_FERNET = True
+except ImportError:  # pragma: no cover - depends on the install
+    Fernet = None
+    HAVE_FERNET = False
+
+_ENC_FERNET = "MVF1:"
+_ENC_XOR = "MVX1:"
+
+
+class ConfigUnreadableError(Exception):
+    """config.toml exists but no available key decrypts it.
+
+    Callers must not treat this as "no config" — overwriting would destroy the
+    stored Spotify refresh token and the ARL.
+    """
+
+
 class Vault:
     _memory_key: Optional[bytes] = None
 
-    @classmethod
-    def _get_key(cls) -> bytes:
-        # 1. Try memory (already loaded)
-        if cls._memory_key:
-            return cls._memory_key
-            
-        # 2. Try local file (.vaultkey) — Primary source for persistence
-        if KEY_FILE.exists():
-            try:
-                cls._memory_key = KEY_FILE.read_bytes().strip()
-                if cls._memory_key:
-                    # Ensure it's padded/truncated to 32 bytes for consistency
-                    cls._memory_key = cls._memory_key.ljust(32, b'\0')[:32]
-                    return cls._memory_key
-            except Exception as e:
-                logger.error(f"Failed to read vault key from file: {e}")
+    @staticmethod
+    def _norm(raw: bytes) -> bytes:
+        return raw.ljust(32, b"\0")[:32]
 
-        # 3. Try Docker Secrets (High security)
+    @classmethod
+    def candidate_keys(cls) -> list:
+        """All keys available on this machine, as (source, key) pairs.
+
+        We try every candidate rather than picking one by precedence: if a host
+        has both a .vaultkey file and MUSIC_VAULT_KEY set, the right key is
+        whichever one actually decrypts the existing config, not whichever we
+        happen to check first.
+        """
+        out, seen = [], set()
+
+        def add(source: str, raw: Optional[bytes]):
+            if not raw:
+                return
+            key = cls._norm(raw)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append((source, key))
+
+        add("memory", cls._memory_key)
         secret_path = Path("/run/secrets/MUSIC_VAULT_KEY")
         if secret_path.exists():
             try:
-                cls._memory_key = secret_path.read_bytes().strip()
-                if cls._memory_key:
-                    cls._memory_key = cls._memory_key.ljust(32, b'\0')[:32]
-                    return cls._memory_key
-            except Exception: pass
-
-        # 4. Try environment variable (Secondary source)
+                add("docker-secret", secret_path.read_bytes().strip())
+            except Exception as e:
+                logger.error(f"Failed to read vault key from Docker secret: {e}")
         env_key = os.environ.get("MUSIC_VAULT_KEY")
         if env_key:
-            cls._memory_key = env_key.encode().ljust(32, b'\0')[:32]
+            add("env:MUSIC_VAULT_KEY", env_key.encode())
+        if KEY_FILE.exists():
+            try:
+                add("file:.vaultkey", KEY_FILE.read_bytes().strip())
+            except Exception as e:
+                logger.error(f"Failed to read vault key from file: {e}")
+        return out
+
+    @classmethod
+    def _get_key(cls) -> bytes:
+        if cls._memory_key:
             return cls._memory_key
-            
-        # 5. Generate and save if nothing else is found
-        # This ensures the app still works "out of the box" and persists to the file
+
+        candidates = cls.candidate_keys()
+        if candidates:
+            cls._memory_key = candidates[0][1]
+            return cls._memory_key
+
+        # Nothing configured — generate one so the app works out of the box
         key = os.urandom(32)
         try:
             KEY_FILE.write_bytes(key)
-            cls._memory_key = key
+            chmod_private(KEY_FILE)
             logger.info(f"Generated new vault key and saved to {KEY_FILE}")
         except Exception as e:
-            logger.error(f"Failed to save vault key: {e}")
-            # Fallback to a transient key if disk is read-only (not ideal for persistence)
-            cls._memory_key = key
-            
-        return cls._memory_key
+            logger.error(
+                f"Failed to save vault key ({e}) — falling back to a transient key. "
+                "Encrypted settings will NOT be readable after a restart."
+            )
+        cls._memory_key = key
+        return key
+
+    @staticmethod
+    def _xor(raw: bytes, key: bytes) -> bytes:
+        return bytes(b ^ key[i % len(key)] for i, b in enumerate(raw))
+
+    @classmethod
+    def _fernet(cls, key: bytes):
+        return Fernet(base64.urlsafe_b64encode(hashlib.sha256(key).digest()))
 
     @classmethod
     def encrypt(cls, data: str) -> str:
-        if not data: return ""
+        if not data:
+            return ""
         key = cls._get_key()
-        raw = data.encode()
-        encrypted = bytearray()
-        for i in range(len(raw)):
-            encrypted.append(raw[i] ^ key[i % len(key)])
-        return base64.b64encode(encrypted).decode()
+        if HAVE_FERNET:
+            return _ENC_FERNET + cls._fernet(key).encrypt(data.encode()).decode()
+        return _ENC_XOR + base64.b64encode(cls._xor(data.encode(), key)).decode()
 
     @classmethod
-    def decrypt(cls, data: str) -> str:
-        if not data: return ""
+    def decrypt_with(cls, data: str, key: bytes) -> Optional[str]:
+        """Decrypt using one specific key. Returns None if that key doesn't fit."""
         try:
-            key = cls._get_key()
-            raw = base64.b64decode(data)
-            decrypted = bytearray()
-            for i in range(len(raw)):
-                decrypted.append(raw[i] ^ key[i % len(key)])
-            return decrypted.decode()
+            if data.startswith(_ENC_FERNET):
+                if not HAVE_FERNET:
+                    return None
+                return cls._fernet(key).decrypt(data[len(_ENC_FERNET):].encode()).decode()
+            # Bare base64 is the pre-prefix legacy XOR format
+            payload = data[len(_ENC_XOR):] if data.startswith(_ENC_XOR) else data
+            return cls._xor(base64.b64decode(payload), key).decode()
         except Exception:
-            return data
+            return None
+
+
+def _looks_like_config(text: str) -> bool:
+    return any(marker in text for marker in ("[deezer]", "[downloads]", "[spotify]"))
+
 
 def read_config_raw() -> str:
+    """Decrypt and return config.toml.
+
+    Raises ConfigUnreadableError when the file exists but cannot be decrypted,
+    so a lost or mismatched vault key surfaces as a loud error instead of
+    silently looking like an empty config.
+    """
     if not CONFIG_FILE.exists():
         return ""
-    content = CONFIG_FILE.read_text()
+    content = CONFIG_FILE.read_text().strip()
     if not content:
         return ""
 
-    # Try to decrypt. If it fails or returns garbage (non-UTF8),
-    # the Vault.decrypt helper returns the original string.
-    decrypted = Vault.decrypt(content)
+    # Plaintext (hand-edited, or written by start.sh's default template)
+    if _looks_like_config(content):
+        return content
 
-    # If the decrypted version looks like valid config, use it.
-    # Otherwise, assume it was already plain text.
-    if "[deezer]" in decrypted or "[downloads]" in decrypted or "[spotify]" in decrypted:
-        return decrypted
+    for source, key in Vault.candidate_keys():
+        plain = Vault.decrypt_with(content, key)
+        if plain and _looks_like_config(plain):
+            if Vault._memory_key != key:
+                logger.info(f"Config decrypted with vault key from {source}")
+                Vault._memory_key = key  # keep writing with the key that works
+            return plain
 
-    return content
+    raise ConfigUnreadableError(
+        f"{CONFIG_FILE} could not be decrypted with any available vault key "
+        "(config/.vaultkey, /run/secrets/MUSIC_VAULT_KEY, $MUSIC_VAULT_KEY). "
+        "Restore the original key to recover these settings — saving new ones "
+        "will overwrite them."
+    )
+
+
+def read_config_safe() -> str:
+    """read_config_raw() for read-only callers that can tolerate a failure."""
+    try:
+        return read_config_raw()
+    except ConfigUnreadableError as e:
+        logger.error(str(e))
+        return ""
+
+
 def write_config_raw(content: str):
-    encrypted = Vault.encrypt(content)
-    CONFIG_FILE.write_text(encrypted)
+    atomic_write(CONFIG_FILE, Vault.encrypt(content))
+    chmod_private(CONFIG_FILE)
+
+
+def toml_escape(value) -> str:
+    """Escape a value for a TOML basic string. Without this, an ARL or secret
+    containing a quote or newline silently corrupts (or injects into) the file."""
+    out = str(value or "")
+    out = out.replace("\\", "\\\\").replace('"', '\\"')
+    return out.replace("\r", "").replace("\n", "\\n").replace("\t", "\\t")
+
+
+def toml_unescape(value: str) -> str:
+    out = value.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t")
+    return out.replace("\\\\", "\\")
 
 # ── Streamrip config template ──────────────────────────────────────────────────
 STREAMRIP_CONFIG_TEMPLATE = """
@@ -254,7 +368,17 @@ check_for_updates = false
 
 # ── Global state ───────────────────────────────────────────────────────────────
 WS_CLIENTS: set = set()
-DOWNLOAD_STATUS: dict = {
+
+# History is capped: `completed` used to grow without bound, and the whole dict
+# is both written to disk and pushed to every websocket client on every tick.
+MAX_COMPLETED = 200
+MAX_FAILED = 200
+MAX_LOGS = 500
+# Clients only need the tail of the history, not all of it, on every update
+BROADCAST_COMPLETED = 25
+BROADCAST_LOGS = 100
+
+DEFAULT_STATUS: dict = {
     "queue": [],
     "active": [],
     "completed": [],
@@ -262,41 +386,130 @@ DOWNLOAD_STATUS: dict = {
     "logs": [],
     "batch_total": 0,
     "batch_completed": 0,
+    "completed_total": 0,
     "last_batch_finished_at": None,
     "library_size": 0,
     "is_paused": False,
 }
+DOWNLOAD_STATUS: dict = json.loads(json.dumps(DEFAULT_STATUS))
 
 DEEZER_MAX_QUALITY = None  # Persistent memory for account capability (0, 1, 2, 3)
 DOWNLOAD_LOCK = asyncio.Lock()
 
+# tid -> the subprocess currently running for it, so Stop can actually
+# terminate downloads instead of only hiding them from the UI.
+ACTIVE_PROCS: dict = {}
+CANCELLED: set = set()
+
+_LOG_SEQ = 0
+
+
+def trim_status():
+    DOWNLOAD_STATUS["completed"] = DOWNLOAD_STATUS["completed"][-MAX_COMPLETED:]
+    DOWNLOAD_STATUS["failed"] = DOWNLOAD_STATUS["failed"][-MAX_FAILED:]
+    DOWNLOAD_STATUS["logs"] = DOWNLOAD_STATUS["logs"][-MAX_LOGS:]
+
 
 def load_status():
-    global DOWNLOAD_STATUS
-    if STATUS_FILE.exists():
+    global DOWNLOAD_STATUS, _LOG_SEQ
+    DOWNLOAD_STATUS = json.loads(json.dumps(DEFAULT_STATUS))
+    if not STATUS_FILE.exists():
+        return
+    try:
+        saved = json.loads(STATUS_FILE.read_text())
+    except Exception as e:
+        logger.error(f"status.json is unreadable ({e}) — starting from a clean state")
+        return
+    if not isinstance(saved, dict):
+        return
+
+    # Merge over the defaults so a file written by an older version can never
+    # leave a required key missing (which used to KeyError at runtime)
+    for key, value in saved.items():
+        if key in DOWNLOAD_STATUS:
+            DOWNLOAD_STATUS[key] = value
+
+    # Downloads that were mid-flight at shutdown are orphaned. Move them to the
+    # failed list rather than dropping them, so they stay visible and retryable
+    # and the batch counter can still reach 100%.
+    orphaned = [x for x in (DOWNLOAD_STATUS.get("active") or []) if isinstance(x, dict)]
+    for item in orphaned:
+        item["status"] = "failed"
+        item["error"] = "interrupted by server restart"
+        item["finished_at"] = time.time()
+    if orphaned:
+        DOWNLOAD_STATUS["failed"].extend(orphaned)
+        DOWNLOAD_STATUS["batch_completed"] += len(orphaned)
+        logger.warning(f"Recovered {len(orphaned)} interrupted download(s) into the failed list")
+    DOWNLOAD_STATUS["active"] = []
+
+    # Seed the running total from history the first time we load a file written
+    # before this counter existed
+    if not DOWNLOAD_STATUS["completed_total"]:
+        DOWNLOAD_STATUS["completed_total"] = len(DOWNLOAD_STATUS["completed"])
+
+    # Nothing pending means the previous batch is over, so its counters carry no
+    # meaning — clear them rather than inheriting drift into the next batch
+    if not DOWNLOAD_STATUS["queue"]:
+        DOWNLOAD_STATUS["batch_total"] = 0
+        DOWNLOAD_STATUS["batch_completed"] = 0
+
+    _LOG_SEQ = max([e.get("seq", 0) for e in DOWNLOAD_STATUS["logs"] if isinstance(e, dict)] or [0])
+    trim_status()
+
+
+def save_status():
+    trim_status()
+    atomic_write(STATUS_FILE, json.dumps(DOWNLOAD_STATUS))
+
+
+# The staging area is kept out of DOWNLOAD_STATUS so it isn't broadcast on every
+# download tick — it changes only when the user edits it.
+STAGING: list = []
+
+
+def load_staging():
+    global STAGING
+    if STAGING_FILE.exists():
         try:
-            DOWNLOAD_STATUS = json.loads(STATUS_FILE.read_text())
-            # Clear active tasks on restart (they were orphaned)
-            DOWNLOAD_STATUS["active"] = []
+            STAGING = json.loads(STAGING_FILE.read_text())
         except Exception:
             pass
 
 
-def save_status():
-    STATUS_FILE.write_text(json.dumps(DOWNLOAD_STATUS, indent=2))
+def save_staging():
+    STAGING_FILE.write_text(json.dumps(STAGING, indent=2))
 
 
 def add_log(msg: str, level: str = "INFO"):
-    entry = {"ts": time.time(), "msg": msg, "level": level}
-    DOWNLOAD_STATUS["logs"] = DOWNLOAD_STATUS["logs"][-499:] + [entry]
+    global _LOG_SEQ
+    _LOG_SEQ += 1
+    # seq lets clients append only what's new instead of re-rendering every line
+    entry = {"seq": _LOG_SEQ, "ts": time.time(), "msg": msg, "level": level}
+    DOWNLOAD_STATUS["logs"] = DOWNLOAD_STATUS["logs"][-(MAX_LOGS - 1):] + [entry]
     logger.info(msg)
 
 
 # ── WebSocket broadcast ────────────────────────────────────────────────────────
+def broadcast_payload() -> dict:
+    """Trimmed view of the status for websocket pushes.
+
+    The full history reached hundreds of KB; sending all of it on every download
+    tick, to every client, was by far the largest source of traffic here.
+    """
+    return {
+        **DOWNLOAD_STATUS,
+        "completed": DOWNLOAD_STATUS["completed"][-BROADCAST_COMPLETED:],
+        "logs": DOWNLOAD_STATUS["logs"][-BROADCAST_LOGS:],
+    }
+
+
 async def broadcast(event: str = "status"):
     global WS_CLIENTS
+    if not WS_CLIENTS:
+        return
     dead = set()
-    payload = json.dumps({"event": event, "data": DOWNLOAD_STATUS})
+    payload = json.dumps({"event": event, "data": broadcast_payload()})
     # Iterate over a copy of the set to avoid RuntimeError: Set changed size during iteration
     for ws in list(WS_CLIENTS):
         try:
@@ -313,7 +526,7 @@ async def ws_handler(request):
     logger.info(f"WS client connected. Total: {len(WS_CLIENTS)}")
     try:
         # Send current state immediately
-        await ws.send_str(json.dumps({"event": "status", "data": DOWNLOAD_STATUS}))
+        await ws.send_str(json.dumps({"event": "status", "data": broadcast_payload()}))
         async for msg in ws:
             if msg.type == WSMsgType.ERROR:
                 break
@@ -321,6 +534,65 @@ async def ws_handler(request):
         WS_CLIENTS.discard(ws)
         logger.info(f"WS client disconnected. Total: {len(WS_CLIENTS)}")
     return ws
+
+
+# ── Access control ─────────────────────────────────────────────────────────────
+# Off by default so existing local setups keep working. Set MV_AUTH_TOKEN to
+# require a shared token — strongly recommended if this port is reachable beyond
+# localhost, since the API exposes credentials and can delete from the library.
+AUTH_TOKEN = os.environ.get("MV_AUTH_TOKEN", "").strip()
+SECRET_MASK = "••••••••"
+
+# Paths reachable without a token: the Spotify redirect (Spotify can't send our
+# header) and the static shell that lets a user present ?token=…
+_AUTH_EXEMPT = {"/api/spotify/callback"}
+
+
+@web.middleware
+async def auth_middleware(request, handler):
+    if not AUTH_TOKEN or request.path in _AUTH_EXEMPT:
+        return await handler(request)
+
+    query_token = request.query.get("token", "")
+    supplied = (
+        request.headers.get("X-Auth-Token", "")
+        or query_token
+        or request.cookies.get("mv_auth", "")
+    )
+    if not (supplied and hmac.compare_digest(supplied, AUTH_TOKEN)):
+        return web.json_response(
+            {"error": "unauthorized — open this page once as /?token=YOUR_TOKEN"},
+            status=401,
+        )
+
+    response = await handler(request)
+    # Presenting the token in the URL once establishes a session cookie
+    if query_token and hasattr(response, "set_cookie"):
+        response.set_cookie(
+            "mv_auth", AUTH_TOKEN, httponly=True, samesite="Lax", max_age=30 * 24 * 3600
+        )
+    return response
+
+
+# ── OAuth state ────────────────────────────────────────────────────────────────
+_OAUTH_STATES: dict = {}
+_OAUTH_STATE_TTL = 600
+
+
+def new_oauth_state() -> str:
+    now = time.time()
+    for state, created in list(_OAUTH_STATES.items()):
+        if now - created > _OAUTH_STATE_TTL:
+            _OAUTH_STATES.pop(state, None)
+    state = secrets.token_urlsafe(24)
+    _OAUTH_STATES[state] = now
+    return state
+
+
+def consume_oauth_state(state: str) -> bool:
+    """Single-use check that a callback belongs to a login we started."""
+    created = _OAUTH_STATES.pop(state or "", None)
+    return created is not None and (time.time() - created) <= _OAUTH_STATE_TTL
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -338,9 +610,14 @@ def is_safe_path(target: Path, base: Path) -> bool:
 
 def sanitize_filename(name: str) -> str:
     # Adding # to prevent URL fragment issues
-    name = re.sub(r'[<>:"/\\|?*#]', "", name)
+    name = re.sub(r'[<>:"/\\|?*#]', "", name or "")
     name = re.sub(r"\s+", " ", name).strip()
-    return name[:200]
+    # Leading/trailing dots are hidden files or filesystem-hostile on some platforms
+    name = name.strip(". ")
+    # Never return "": that would resolve to the parent directory, dumping the
+    # download into downloads/singles itself and making the "already downloaded"
+    # check match every track.
+    return name[:200] or "untitled"
 
 
 def clean_track_title(title: str) -> str:
@@ -431,19 +708,36 @@ def deezer_cover_url(artist: str, title: str) -> Optional[str]:
     return None
 
 
-# Simple LRU cache for cover URLs: key=(artist, title) -> image bytes or None
-_COVER_CACHE: dict = {}
+# LRU cache for covers: key=(artist, title) -> image bytes or None. Bounded by
+# both entry count and total bytes, since these are full JPEGs.
+_COVER_CACHE: "OrderedDict[tuple, Optional[bytes]]" = OrderedDict()
 _COVER_CACHE_MAX = 500
+_COVER_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_cover_cache_bytes = 0
+
+
+def _cover_cache_put(key: tuple, value: Optional[bytes]):
+    global _cover_cache_bytes
+    if key in _COVER_CACHE:
+        _cover_cache_bytes -= len(_COVER_CACHE.pop(key) or b"")
+    _COVER_CACHE[key] = value
+    _cover_cache_bytes += len(value or b"")
+    while _COVER_CACHE and (
+        len(_COVER_CACHE) > _COVER_CACHE_MAX or _cover_cache_bytes > _COVER_CACHE_MAX_BYTES
+    ):
+        _, evicted = _COVER_CACHE.popitem(last=False)
+        _cover_cache_bytes -= len(evicted or b"")
+
 
 async def _fetch_cover_bytes(artist: str, title: str) -> Optional[bytes]:
     """Async: look up cover URL from Deezer and fetch image bytes. Uses in-memory cache."""
     cache_key = (artist.lower().strip(), title.lower().strip())
     if cache_key in _COVER_CACHE:
+        _COVER_CACHE.move_to_end(cache_key)  # keep it hot
         return _COVER_CACHE[cache_key]
 
-    # Look up URL via Deezer search (still sync, but runs in executor to avoid blocking)
-    loop = asyncio.get_running_loop()
-    url = await loop.run_in_executor(None, deezer_cover_url, artist, title)
+    # Look up URL via Deezer search (still sync, so keep it off the event loop)
+    url = await asyncio.to_thread(deezer_cover_url, artist, title)
 
     result = None
     if url:
@@ -457,10 +751,7 @@ async def _fetch_cover_bytes(artist: str, title: str) -> Optional[bytes]:
         except Exception:
             pass
 
-    # Evict oldest entry if cache is full
-    if len(_COVER_CACHE) >= _COVER_CACHE_MAX:
-        _COVER_CACHE.pop(next(iter(_COVER_CACHE)))
-    _COVER_CACHE[cache_key] = result
+    _cover_cache_put(cache_key, result)
     return result
 
 
@@ -470,21 +761,86 @@ def read_arl() -> Optional[str]:
     if arl:
         return arl
     # Read from our config.toml
-    content = read_config_raw()
-    if content:
-        m = re.search(r'arl\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', content)
-        if m:
-            val = m.group(1).strip()
-            if val:
-                return val
-    return None
+    val = get_val_from_content(read_config_safe(), "arl", "deezer").strip()
+    return val or None
 
 
 # ── Download engine ────────────────────────────────────────────────────────────
-async def run_streamrip(track_id: str, out_dir: Path) -> bool:
+def find_rip() -> Optional[str]:
+    """Locate the streamrip CLI, including the usual pipx install locations."""
+    found = shutil.which("rip")
+    if found:
+        return found
+    for candidate in (
+        Path.home() / ".local" / "bin" / "rip",
+        Path("/root/.local/bin/rip"),
+        Path("/usr/local/bin/rip"),
+    ):
+        try:
+            if candidate.exists():
+                return str(candidate)
+        except OSError:
+            continue
+    return None
+
+
+def kill_download(tid: str):
+    """Terminate the subprocess for a download and mark it cancelled so the
+    pipeline doesn't move on to the next fallback."""
+    CANCELLED.add(tid)
+    proc = ACTIVE_PROCS.get(tid)
+    if proc is not None and proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        except Exception as e:
+            logger.warning(f"Failed to kill subprocess for {tid}: {e}")
+
+
+async def _run_tracked(tid: str, cmd: list, timeout: int) -> tuple:
+    """Run a subprocess registered against `tid` so it can be cancelled.
+
+    Returns (returncode, stdout, stderr). On timeout the process is killed
+    rather than left running detached, which is what `wait_for` alone did.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    if tid:
+        ACTIVE_PROCS[tid] = proc
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode, stdout or b"", stderr or b""
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+            await proc.wait()
+        except Exception:
+            pass
+        raise
+    finally:
+        if tid:
+            ACTIVE_PROCS.pop(tid, None)
+
+
+AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".ogg", ".opus"}
+# Errors that specifically mean "this account can't have this bitrate". Anything
+# else (network, region block, bad ARL) must NOT trigger a quality step-down.
+QUALITY_REJECTED = (
+    "not available for your account",
+    "does not support",
+    "codec not available",
+    "not authorized",
+)
+
+
+async def run_streamrip(track_id: str, out_dir: Path, tid: str = "") -> bool:
     """
     Attempts to download a track from Deezer using streamrip.
-    It will automatically 'step down' in quality if the user's account doesn't support 
+    It will automatically 'step down' in quality if the user's account doesn't support
     the requested bitrate (e.g. trying to download FLAC on a free account).
     """
     global DEEZER_MAX_QUALITY
@@ -493,16 +849,17 @@ async def run_streamrip(track_id: str, out_dir: Path) -> bool:
         logger.warning("No ARL configured — skipping streamrip")
         return False
 
+    rip_cmd = find_rip()
+    if not rip_cmd:
+        add_log("The 'rip' command was not found. Using YouTube fallback.", "ERROR")
+        return False
+
     # Get user's preferred quality from config
     user_quality = 1 # Default 320kbps
-    if CONFIG_FILE.exists():
-        content = read_config_raw()
-        m = re.search(r'quality\s*=\s*"([^"]*)"', content)
-        if m:
-            q_str = m.group(1)
-            if q_str == "FLAC": user_quality = 2
-            elif q_str == "MP3_320": user_quality = 1
-            elif q_str == "MP3_128": user_quality = 0
+    q_str = get_val_from_content(read_config_safe(), "quality", "downloads")
+    if q_str == "FLAC": user_quality = 2
+    elif q_str == "MP3_320": user_quality = 1
+    elif q_str == "MP3_128": user_quality = 0
 
     # Start from the lower of (User Preference) vs (Last Known Max Capability)
     starting_quality = user_quality
@@ -511,83 +868,81 @@ async def run_streamrip(track_id: str, out_dir: Path) -> bool:
 
     # Qualities to try in descending order (2=FLAC, 1=320, 0=128)
     qualities_to_try = [q for q in [2, 1, 0] if q <= starting_quality]
-    
-    sr_config = CONFIG_DIR / "streamrip_config.toml"
 
-    for q in qualities_to_try:
-        add_log(f"Attempting Deezer download at quality level {q}...")
-        
-        try:
-            cfg_text = STREAMRIP_CONFIG_TEMPLATE.replace("__ARL__", arl) \
-                                              .replace("__FOLDER__", str(out_dir)) \
-                                              .replace("__QUALITY__", str(q))
-            sr_config.write_text(cfg_text)
-        except Exception as e:
-            logger.warning(f"Failed to write streamrip config: {e}")
-            return False
+    # Unique per download: concurrent downloads sharing one config file could
+    # overwrite each other's output folder between the write and the exec,
+    # landing one track's audio in another track's directory.
+    sr_config = CONFIG_DIR / f"streamrip_{uuid.uuid4().hex}.toml"
+    stepped_down = False
 
-        # Standard check
-        rip_cmd = "rip"
-        if not shutil.which(rip_cmd):
-            pipx_rip = Path("/root/.local/bin/rip")
-            if pipx_rip.exists():
-                rip_cmd = str(pipx_rip)
+    try:
+        for q in qualities_to_try:
+            if tid and tid in CANCELLED:
+                return False
+            add_log(f"Attempting Deezer download at quality level {q}...")
 
-        cmd = [rip_cmd, "--config-path", str(sr_config), "url",
-               f"https://www.deezer.com/track/{track_id}"]
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
-            out = (stdout + stderr).decode(errors="replace")
-            
-            # Look for quality errors
-            error_keywords = [
-                "not available for your account",
-                "does not support",
-                "Codec not available",
-                "not authorized",
-                "not found" # Sometimes streamrip reports not found for forbidden quality
-            ]
-            
-            if proc.returncode != 0:
-                add_log(f"streamrip exited {proc.returncode} for quality {q}. Output: {out[:300]}", "WARNING")
-                if any(k.lower() in out.lower() for k in error_keywords):
-                    add_log(f"Quality {q} not supported by this account. Stepping down...", "WARNING")
-                    continue
-                else:
-                    continue
+            try:
+                cfg_text = STREAMRIP_CONFIG_TEMPLATE.replace("__ARL__", arl) \
+                                                  .replace("__FOLDER__", str(out_dir)) \
+                                                  .replace("__QUALITY__", str(q))
+                sr_config.write_text(cfg_text)
+                chmod_private(sr_config)  # contains the ARL in plaintext
+            except Exception as e:
+                logger.warning(f"Failed to write streamrip config: {e}")
+                return False
 
-            # Verify a file appeared
-            files = list(out_dir.glob("*.*"))
-            audio_exts = {".flac", ".mp3", ".m4a", ".ogg", ".opus"}
-            if any(f.suffix.lower() in audio_exts for f in files):
-                # SUCCESS! Remember this quality level
-                if DEEZER_MAX_QUALITY is None or q > DEEZER_MAX_QUALITY:
-                    # We only update if we haven't set it yet, or found a higher one (unlikely in step-down)
-                    # but if we started at a lower preference, don't assume we can do higher
-                    if DEEZER_MAX_QUALITY is None:
+            cmd = [rip_cmd, "--config-path", str(sr_config), "url",
+                   f"https://www.deezer.com/track/{track_id}"]
+            try:
+                returncode, stdout, stderr = await _run_tracked(tid, cmd, timeout=180)
+                out = (stdout + stderr).decode(errors="replace")
+
+                if returncode != 0:
+                    if tid and tid in CANCELLED:
+                        return False
+                    is_quality_issue = any(k in out.lower() for k in QUALITY_REJECTED)
+                    if is_quality_issue and q != qualities_to_try[-1]:
+                        add_log(f"Quality {q} not supported by this account. Stepping down...", "WARNING")
+                        stepped_down = True
+                        continue
+                    # Not a quality problem — stepping down wouldn't help, and
+                    # succeeding at a lower level would wrongly pin the account
+                    # to that bitrate for the rest of the session.
+                    add_log(f"streamrip exited {returncode} at quality {q}. Output: {out[:300]}", "WARNING")
+                    return False
+
+                # Verify a file appeared
+                if any(f.suffix.lower() in AUDIO_EXTS for f in out_dir.rglob("*") if f.is_file()):
+                    # Only conclude anything about the account's ceiling if we
+                    # actually saw it reject a higher quality
+                    if stepped_down and DEEZER_MAX_QUALITY is None:
                         DEEZER_MAX_QUALITY = q
                         add_log(f"Account capability locked to quality level {q}")
-                return True
+                    return True
 
-        except FileNotFoundError:
-            add_log("The 'rip' command was not found in the system PATH. Using YouTube fallback.", "ERROR")
-            return False
-        except asyncio.TimeoutError:
-            logger.warning(f"streamrip timed out at quality {q}")
-            continue
-        except Exception as e:
-            logger.error(f"streamrip error at quality {q}: {e}")
-            continue
+                add_log(f"streamrip exited cleanly at quality {q} but produced no audio", "WARNING")
+                return False
 
-    return False
+            except FileNotFoundError:
+                add_log("The 'rip' command was not found in the system PATH. Using YouTube fallback.", "ERROR")
+                return False
+            except asyncio.TimeoutError:
+                # A timeout says nothing about quality, so don't step down
+                logger.warning(f"streamrip timed out at quality {q}")
+                return False
+            except Exception as e:
+                logger.error(f"streamrip error at quality {q}: {e}")
+                return False
+
+        return False
+    finally:
+        try:
+            sr_config.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
-async def run_ytdlp(query: str, out_dir: Path, filename: str, metadata_artist: str = "", metadata_title: str = "", metadata_album: str = "") -> bool:
+async def run_ytdlp(query: str, out_dir: Path, filename: str, metadata_artist: str = "", metadata_title: str = "", metadata_album: str = "", tid: str = "") -> bool:
     safe = sanitize_filename(filename)
     out_tmpl = str(out_dir / f"{safe}.%(ext)s")
     cmd = [
@@ -602,22 +957,17 @@ async def run_ytdlp(query: str, out_dir: Path, filename: str, metadata_artist: s
         "--convert-thumbnails", "jpg", # ensure thumbnail is saved as JPEG
         "--embed-metadata",
     ]
-    
+
     if metadata_artist:
         cmd.extend(["--parse-metadata", f"{metadata_artist}:%(artist)s"])
     if metadata_title:
         cmd.extend(["--parse-metadata", f"{metadata_title}:%(title)s"])
     if metadata_album:
         cmd.extend(["--parse-metadata", f"{metadata_album}:%(album)s"])
-        
+
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
-        if proc.returncode != 0:
+        returncode, _, _ = await _run_tracked(tid, cmd, timeout=300)
+        if returncode != 0:
             return False
 
         # Find the downloaded thumbnail and copy it to cover.jpg
@@ -647,28 +997,13 @@ async def run_ytdlp(query: str, out_dir: Path, filename: str, metadata_artist: s
         return False
 
 
-async def process_download(item: dict):
+async def _attempt_download(item: dict, out_dir: Path) -> tuple:
+    """Run the Deezer → YouTube pipeline. Returns (success, method)."""
     tid = item["id"]
     artist = item.get("artist", "")
     title = item.get("title", "")
     album = item.get("album", "")
     deezer_id = item.get("deezer_id")
-    
-    # Determine output directory
-    playlist_name = item.get("playlist_name")
-    if playlist_name:
-        out_dir = PLAYLISTS_DIR / sanitize_filename(str(playlist_name)) / sanitize_filename(f"{artist} - {title}" if artist else title)
-    else:
-        out_dir = SINGLES_DIR / sanitize_filename(f"{artist} - {title}" if artist else title)
-        
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    add_log(f"Starting download: {artist} - {title}")
-
-    await broadcast()
-
-    success = False
-    method = "unknown"
 
     # Step 1: Try streamrip (Deezer)
     # We prioritize downloading the official, high-bitrate studio file from Deezer.
@@ -679,8 +1014,7 @@ async def process_download(item: dict):
         # Try to find a real Deezer ID if we only have title/artist or a non-numeric ID
         search_query = f"{artist} {title}"
         add_log(f"Searching Deezer ID for: {search_query}")
-        loop = asyncio.get_running_loop()
-        search_results = await loop.run_in_executor(None, lambda: deezer_search(search_query, limit=1))
+        search_results = await asyncio.to_thread(deezer_search, search_query, 1)
         if search_results:
             deezer_id = search_results[0].get("id")
             add_log(f"Found Deezer ID: {deezer_id}")
@@ -688,41 +1022,101 @@ async def process_download(item: dict):
         else:
             add_log(f"No Deezer ID found for {search_query}", "WARNING")
 
+    if tid in CANCELLED:
+        return False, "cancelled"
+
     if is_valid_deezer_id and deezer_id:
         add_log(f"Trying Deezer (streamrip) for track {deezer_id}")
-        success = await run_streamrip(str(deezer_id), out_dir)
-        if success:
-            method = "deezer"
+        if await run_streamrip(str(deezer_id), out_dir, tid=tid):
             add_log(f"✓ Deezer download succeeded: {title}")
+            return True, "deezer"
+
+    if tid in CANCELLED:
+        return False, "cancelled"
 
     # Step 2: Fallback to yt-dlp (YouTube)
     # If Deezer doesn't have the track (e.g. an unreleased leak or underground mix), or
     # if streamrip fails due to regional blocks, we gracefully fallback to ripping the audio from YouTube.
-    if not success:
-        add_log(f"Falling back to yt-dlp for: {artist} - {title}", "INFO")
-        query = f"{artist} {title} official audio" if artist else title
-        success = await run_ytdlp(query, out_dir, f"{artist} - {title}" if artist else title, metadata_artist=artist, metadata_title=title, metadata_album=album)
-        if success:
-            method = "youtube"
-            add_log(f"✓ YouTube fallback succeeded: {title}")
+    add_log(f"Falling back to yt-dlp for: {artist} - {title}", "INFO")
+    query = f"{artist} {title} official audio" if artist else title
+    if await run_ytdlp(
+        query, out_dir, f"{artist} - {title}" if artist else title,
+        metadata_artist=artist, metadata_title=title, metadata_album=album, tid=tid,
+    ):
+        add_log(f"✓ YouTube fallback succeeded: {title}")
+        return True, "youtube"
 
-    # Finalize
+    return False, "unknown"
+
+
+async def process_download(item: dict):
+    tid = item["id"]
+    artist = item.get("artist", "")
+    title = item.get("title", "")
+    CANCELLED.discard(tid)
+
+    # Determine output directory
+    playlist_name = item.get("playlist_name")
+    label = sanitize_filename(f"{artist} - {title}" if artist else title)
+    if playlist_name:
+        out_dir = PLAYLISTS_DIR / sanitize_filename(str(playlist_name)) / label
+    else:
+        out_dir = SINGLES_DIR / label
+
+    success, method, error = False, "unknown", ""
+
+    # Everything below runs under try/finally: if any step raises, the item MUST
+    # still leave `active`, or it permanently occupies one of the three
+    # concurrency slots and eventually deadlocks the queue.
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        add_log(f"Starting download: {artist} - {title}")
+        await broadcast()
+        success, method = await _attempt_download(item, out_dir)
+    except Exception as e:
+        logger.exception(f"Download crashed for {artist} - {title}")
+        success, method, error = False, "error", str(e)
+        add_log(f"✗ Download crashed: {artist} - {title} ({e})", "ERROR")
+    finally:
+        try:
+            await _finalize_download(item, out_dir, success, method, error)
+        except Exception:
+            logger.exception("Failed to finalize download")
+
+
+async def _finalize_download(item: dict, out_dir: Path, success: bool, method: str, error: str):
+    tid = item["id"]
+    artist = item.get("artist", "")
+    title = item.get("title", "")
+    cancelled = tid in CANCELLED
+    CANCELLED.discard(tid)
+
     async with DOWNLOAD_LOCK:
-        DOWNLOAD_STATUS["active"] = [x for x in DOWNLOAD_STATUS["active"] if x["id"] != tid]
-        DOWNLOAD_STATUS["batch_completed"] += 1
-        
+        was_active = any(x.get("id") == tid for x in DOWNLOAD_STATUS["active"])
+        DOWNLOAD_STATUS["active"] = [x for x in DOWNLOAD_STATUS["active"] if x.get("id") != tid]
+        # Only count it if it was still part of the batch — a stopped or removed
+        # download has already had the batch reset out from under it.
+        if was_active:
+            DOWNLOAD_STATUS["batch_completed"] += 1
+
         # If queue and active are now empty, the batch is done
         if not DOWNLOAD_STATUS["queue"] and not DOWNLOAD_STATUS["active"]:
             DOWNLOAD_STATUS["last_batch_finished_at"] = time.time()
-            
+
         item["status"] = "completed" if success else "failed"
         item["method"] = method
         item["finished_at"] = time.time()
         item["path"] = str(out_dir)
+        if error:
+            item["error"] = error
+
         if success:
             DOWNLOAD_STATUS["completed"].append(item)
+            DOWNLOAD_STATUS["completed_total"] += 1
             add_log(f"✓ Completed [{method}]: {artist} - {title}")
-        else:
+        elif cancelled:
+            add_log(f"■ Cancelled: {artist} - {title}", "WARNING")
+        elif was_active:
             DOWNLOAD_STATUS["failed"].append(item)
             add_log(f"✗ Failed: {artist} - {title}", "ERROR")
         save_status()
@@ -757,7 +1151,9 @@ async def search_suggestions(request):
     q = request.rel_url.query.get("q", "")
     if not q:
         return web.json_response([])
-    tracks = deezer_search(q, limit=15)
+    # deezer_search is synchronous `requests`; on the event loop it stalled every
+    # connected client for up to the full 8s timeout on each keystroke
+    tracks = await asyncio.to_thread(deezer_search, q, 15)
     results = []
     for t in tracks:
         results.append({
@@ -805,10 +1201,10 @@ async def search_playlist(request):
         playlist_title = "Unknown Playlist"
         is_single = False
         try:
-            proc = await asyncio.create_subprocess_exec(*title_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
-            if proc.returncode == 0:
-                raw_title = stdout.decode().strip()
+            # _run_tracked kills the process on timeout instead of leaking it
+            returncode, stdout, _ = await _run_tracked("", title_cmd, timeout=10)
+            if returncode == 0:
+                raw_title = stdout.decode(errors="replace").strip()
                 # yt-dlp returns "NA" for the playlist title if the URL is a single video
                 if raw_title == "NA":
                     is_single = True
@@ -824,14 +1220,9 @@ async def search_playlist(request):
             url
         ]
         
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        
-        if proc.returncode != 0:
+        returncode, stdout, stderr = await _run_tracked("", cmd, timeout=60)
+
+        if returncode != 0:
             err = stderr.decode().strip()
             logger.error(f"yt-dlp playlist error: {err}")
             return web.json_response({"error": f"Failed to fetch playlist: {err[:100]}"}, status=500)
@@ -935,7 +1326,7 @@ async def handle_spotify_playlist(url):
 
         # If the playlist is large (100+ tracks), we MUST use the Spotify Web API 
         # to fetch the full list, as the embed is limited to 100 items.
-        content = read_config_raw()
+        content = read_config_safe()
         client_id = get_val_from_content(content, "client_id", "spotify")
         client_secret = get_val_from_content(content, "client_secret", "spotify")
         user_access_token = get_val_from_content(content, "access_token", "spotify")
@@ -1145,27 +1536,48 @@ async def download_single(request):
     return web.json_response({"ok": True, "id": item["id"]})
 
 
-_AUDIO_EXTS = {".flac", ".mp3", ".m4a", ".ogg", ".opus"}
-
-def is_already_downloaded(artist: str, title: str, playlist_name: str | None) -> bool:
+def is_already_downloaded(artist: str, title: str, playlist_name: Optional[str]) -> bool:
     """Return True if the expected output directory already contains an audio file."""
     label = sanitize_filename(f"{artist} - {title}" if artist else title)
     if playlist_name:
         out_dir = PLAYLISTS_DIR / sanitize_filename(str(playlist_name)) / label
     else:
         out_dir = SINGLES_DIR / label
-    if not out_dir.exists():
+    try:
+        if not out_dir.exists():
+            return False
+        return any(f.suffix.lower() in AUDIO_EXTS for f in out_dir.iterdir() if f.is_file())
+    except OSError:
         return False
-    return any(f.suffix.lower() in _AUDIO_EXTS for f in out_dir.iterdir() if f.is_file())
+
+
+def _downloaded_flags(tracks: list) -> list:
+    """Disk check for a batch of tracks. Runs in a thread — a large playlist
+    import is one iterdir() per track and used to block the event loop."""
+    return [
+        is_already_downloaded(t.get("artist", ""), t.get("title", ""), t.get("playlist_name"))
+        for t in tracks
+    ]
+
+
+def _track_key(t: dict) -> tuple:
+    """Identity used to detect a track that is already queued."""
+    return (
+        (t.get("artist") or "").strip().lower(),
+        (t.get("title") or "").strip().lower(),
+        (t.get("playlist_name") or None),
+    )
 
 
 async def check_downloaded(request):
     body = await request.json()
     tracks = body.get("tracks", [])
-    results = []
-    for t in tracks:
-        already = is_already_downloaded(t.get("artist", ""), t.get("title", ""), t.get("playlist_name"))
-        results.append({"title": t.get("title"), "artist": t.get("artist"), "playlist_name": t.get("playlist_name"), "downloaded": already})
+    flags = await asyncio.to_thread(_downloaded_flags, tracks)
+    results = [
+        {"title": t.get("title"), "artist": t.get("artist"),
+         "playlist_name": t.get("playlist_name"), "downloaded": already}
+        for t, already in zip(tracks, flags)
+    ]
     return web.json_response(results)
 
 
@@ -1174,13 +1586,23 @@ async def download_playlist(request):
     tracks = body.get("tracks", [])
     ids = []
     skipped = 0
+    # Disk check before taking the lock so it never blocks the event loop
+    flags = await asyncio.to_thread(_downloaded_flags, tracks)
+
     async with DOWNLOAD_LOCK:
+        # Skip anything already on disk *or* already waiting in the queue —
+        # without the latter, re-clicking Sync queued everything a second time
+        queued_keys = {
+            _track_key(x) for x in DOWNLOAD_STATUS["queue"] + DOWNLOAD_STATUS["active"]
+        }
         to_queue = []
-        for t in tracks:
-            if is_already_downloaded(t.get("artist", ""), t.get("title", ""), t.get("playlist_name")):
+        for t, already in zip(tracks, flags):
+            key = _track_key(t)
+            if already or key in queued_keys:
                 skipped += 1
-            else:
-                to_queue.append(t)
+                continue
+            queued_keys.add(key)
+            to_queue.append(t)
 
         if not DOWNLOAD_STATUS["queue"] and not DOWNLOAD_STATUS["active"]:
             DOWNLOAD_STATUS["batch_total"] = len(to_queue)
@@ -1208,6 +1630,25 @@ async def download_playlist(request):
     return web.json_response({"ok": True, "ids": ids, "count": len(ids), "skipped": skipped})
 
 
+async def get_staging(request):
+    return web.json_response(STAGING)
+
+
+async def set_staging(request):
+    global STAGING
+    try:
+        body = await request.json()
+        tracks = body.get("tracks")
+        if not isinstance(tracks, list):
+            return web.json_response({"error": "tracks must be a list"}, status=400)
+        STAGING = tracks
+        save_staging()
+        return web.json_response({"ok": True, "count": len(STAGING)})
+    except Exception as e:
+        logger.exception("Failed to save staging")
+        return web.json_response({"error": str(e)}, status=400)
+
+
 async def clear_queue(request):
     body = {}
     try:
@@ -1231,6 +1672,7 @@ async def clear_queue(request):
         if clear_all:
             DOWNLOAD_STATUS["completed"] = []
             DOWNLOAD_STATUS["failed"] = []
+            DOWNLOAD_STATUS["completed_total"] = 0
         save_status()
     await broadcast()
     return web.json_response({"ok": True})
@@ -1242,28 +1684,30 @@ async def remove_from_queue(request):
         tid = body.get("id")
         if not tid:
             return web.json_response({"error": "No ID provided"}, status=400)
-        
+
         async with DOWNLOAD_LOCK:
             # Check queue
             original_len = len(DOWNLOAD_STATUS["queue"])
-            DOWNLOAD_STATUS["queue"] = [x for x in DOWNLOAD_STATUS["queue"] if x["id"] != tid]
+            DOWNLOAD_STATUS["queue"] = [x for x in DOWNLOAD_STATUS["queue"] if x.get("id") != tid]
             removed = len(DOWNLOAD_STATUS["queue"]) < original_len
-            
-            # Note: Removing from "active" is trickier as a process is running. 
-            # For now we'll just remove it from the list so it doesn't show in UI.
-            # Real cancellation would require tracking task objects.
-            original_active_len = len(DOWNLOAD_STATUS["active"])
-            DOWNLOAD_STATUS["active"] = [x for x in DOWNLOAD_STATUS["active"] if x["id"] != tid]
-            removed = removed or (len(DOWNLOAD_STATUS["active"]) < original_active_len)
+
+            # If it's mid-download, actually kill the subprocess rather than
+            # just hiding it from the UI while it keeps writing to disk
+            was_active = any(x.get("id") == tid for x in DOWNLOAD_STATUS["active"])
+            if was_active:
+                DOWNLOAD_STATUS["active"] = [x for x in DOWNLOAD_STATUS["active"] if x.get("id") != tid]
+                DOWNLOAD_STATUS["batch_total"] = max(0, DOWNLOAD_STATUS["batch_total"] - 1)
+                kill_download(tid)
+                removed = True
 
             # Also dismiss individual entries from the failed list
             original_failed_len = len(DOWNLOAD_STATUS["failed"])
-            DOWNLOAD_STATUS["failed"] = [x for x in DOWNLOAD_STATUS["failed"] if x["id"] != tid]
+            DOWNLOAD_STATUS["failed"] = [x for x in DOWNLOAD_STATUS["failed"] if x.get("id") != tid]
             removed = removed or (len(DOWNLOAD_STATUS["failed"]) < original_failed_len)
 
             if removed:
                 save_status()
-                
+
         await broadcast()
         return web.json_response({"ok": True})
     except Exception as e:
@@ -1272,11 +1716,18 @@ async def remove_from_queue(request):
 
 async def stop_downloads(request):
     async with DOWNLOAD_LOCK:
+        # Kill the running subprocesses — clearing the list alone left yt-dlp and
+        # streamrip running and still writing files after "Stop"
+        for item in DOWNLOAD_STATUS["active"]:
+            kill_download(item.get("id", ""))
+        stopped = len(DOWNLOAD_STATUS["active"])
         DOWNLOAD_STATUS["queue"] = []
         DOWNLOAD_STATUS["active"] = []
         DOWNLOAD_STATUS["batch_total"] = 0
         DOWNLOAD_STATUS["batch_completed"] = 0
         DOWNLOAD_STATUS["is_paused"] = False
+        if stopped:
+            add_log(f"Stopped {stopped} in-flight download(s)", "WARNING")
         save_status()
     await broadcast()
     return web.json_response({"ok": True})
@@ -1293,30 +1744,45 @@ async def toggle_pause(request):
 
 
 async def retry_track(request):
+    """Requeue one failed track, a list of them, or all of them.
+
+    Bulk retry used to be N separate requests from the browser, each triggering
+    its own status write and full broadcast.
+    """
     try:
         body = await request.json()
         tid = body.get("id")
-        if not tid:
+        ids = body.get("ids")
+        retry_all = bool(body.get("all"))
+        if not (tid or ids or retry_all):
             return web.json_response({"error": "No ID provided"}, status=400)
-        
+
         async with DOWNLOAD_LOCK:
-            # Find in failed
-            failed_item = next((x for x in DOWNLOAD_STATUS["failed"] if x["id"] == tid), None)
-            if failed_item:
-                # Remove from failed
-                DOWNLOAD_STATUS["failed"] = [x for x in DOWNLOAD_STATUS["failed"] if x["id"] != tid]
-                # Prepare for retry
-                failed_item["status"] = "pending"
-                failed_item["queued_at"] = time.time()
-                # Clean up old timestamps
-                failed_item.pop("finished_at", None)
-                failed_item.pop("started_at", None)
-                # Add back to queue
-                DOWNLOAD_STATUS["queue"].append(failed_item)
+            if retry_all:
+                wanted = {x.get("id") for x in DOWNLOAD_STATUS["failed"]}
+            else:
+                wanted = set(ids or []) | ({tid} if tid else set())
+
+            requeued = [x for x in DOWNLOAD_STATUS["failed"] if x.get("id") in wanted]
+            if requeued:
+                DOWNLOAD_STATUS["failed"] = [
+                    x for x in DOWNLOAD_STATUS["failed"] if x.get("id") not in wanted
+                ]
+                for item in requeued:
+                    item["status"] = "pending"
+                    item["queued_at"] = time.time()
+                    # Clean up state from the previous attempt
+                    item.pop("finished_at", None)
+                    item.pop("started_at", None)
+                    item.pop("error", None)
+                    DOWNLOAD_STATUS["queue"].append(item)
+                # Retries are part of the batch too — without this the progress
+                # bar counted completions against a total that never grew
+                DOWNLOAD_STATUS["batch_total"] += len(requeued)
                 save_status()
-                
+
         await broadcast()
-        return web.json_response({"ok": True})
+        return web.json_response({"ok": True, "count": len(requeued)})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
@@ -1357,33 +1823,50 @@ async def track_cover(request):
 
 
 def get_folder_size(path: Path) -> int:
-    return sum(f.stat().st_size for f in path.rglob('*') if f.is_file())
+    total = 0
+    for f in path.rglob('*'):
+        try:
+            if f.is_file():
+                total += f.stat().st_size
+        except OSError:
+            continue  # file vanished mid-scan (an active download, a delete)
+    return total
+
+
+# A full rglob over the library is expensive and was being run per directory
+# listing and once per completed download. Cache it.
+_LIB_SIZE = {"value": 0, "ts": 0.0}
+_LIB_SIZE_TTL = 60
+
+
+async def get_library_size(force: bool = False) -> int:
+    now = time.time()
+    if not force and (now - _LIB_SIZE["ts"]) < _LIB_SIZE_TTL:
+        return int(_LIB_SIZE["value"])
+    size = await asyncio.to_thread(get_folder_size, DOWNLOADS_DIR)
+    _LIB_SIZE.update(value=size, ts=now)
+    return size
 
 
 async def refresh_library_size():
-    """Recompute DOWNLOADS_DIR size in a thread and push it via broadcast."""
-    loop = asyncio.get_running_loop()
-    size = await loop.run_in_executor(None, get_folder_size, DOWNLOADS_DIR)
-    DOWNLOAD_STATUS["library_size"] = size
-    await broadcast()
+    """Recompute DOWNLOADS_DIR size (rate-limited) and push it via broadcast."""
+    before = DOWNLOAD_STATUS.get("library_size")
+    DOWNLOAD_STATUS["library_size"] = await get_library_size()
+    if DOWNLOAD_STATUS["library_size"] != before:
+        await broadcast()
 
 
-async def list_files(request):
-    path_param = request.rel_url.query.get("path", "")
-    base = DOWNLOADS_DIR
-    target = (base / path_param).resolve()
-    if not is_safe_path(target, base):
-        return web.json_response({"error": "forbidden"}, status=403)
-    if not target.exists():
-        return web.json_response({"error": "not found"}, status=404)
-
+def _scan_dir(target: Path) -> list:
     items = []
     try:
         # Use target.iterdir() but ensure paths are relative to DOWNLOADS_DIR for frontend
         for entry in sorted(target.iterdir(), key=lambda e: (e.is_file(), e.name.lower())):
-            stat = entry.stat()
+            try:
+                stat = entry.stat()
+            except OSError:
+                continue
             rel_path = str(entry.relative_to(DOWNLOADS_DIR))
-            
+
             has_cover = False
             if entry.is_dir():
                 for name in ["cover.jpg", "cover.png", "folder.jpg", "folder.png"]:
@@ -1402,11 +1885,23 @@ async def list_files(request):
             })
     except PermissionError:
         pass
+    return items
 
-    # Disk usage
-    total, used, free = shutil.disk_usage(str(base))
-    folder_size = get_folder_size(base)
-    
+
+async def list_files(request):
+    path_param = request.rel_url.query.get("path", "")
+    base = DOWNLOADS_DIR
+    target = (base / path_param).resolve()
+    if not is_safe_path(target, base):
+        return web.json_response({"error": "forbidden"}, status=403)
+    if not target.exists():
+        return web.json_response({"error": "not found"}, status=404)
+
+    # Directory scan and disk stat both hit the filesystem — keep them off the loop
+    items = await asyncio.to_thread(_scan_dir, target)
+    total, used, free = await asyncio.to_thread(shutil.disk_usage, str(base))
+    folder_size = await get_library_size()
+
     return web.json_response({
         "items": items,
         "path": path_param,
@@ -1422,8 +1917,19 @@ async def rename_file(request):
     src = (DOWNLOADS_DIR / rel).resolve()
     if not is_safe_path(src, DOWNLOADS_DIR):
         return web.json_response({"error": "forbidden"}, status=403)
+    if not src.exists():
+        return web.json_response({"error": "not found"}, status=404)
     dst = src.parent / new_name
-    src.rename(dst)
+    # sanitize_filename strips separators, but re-check: the destination must
+    # still land inside the library and must not clobber an existing entry
+    if not is_safe_path(dst, DOWNLOADS_DIR):
+        return web.json_response({"error": "forbidden"}, status=403)
+    if dst.exists():
+        return web.json_response({"error": "a file with that name already exists"}, status=409)
+    try:
+        await asyncio.to_thread(src.rename, dst)
+    except OSError as e:
+        return web.json_response({"error": str(e)}, status=500)
     return web.json_response({"ok": True})
 
 
@@ -1433,11 +1939,25 @@ async def delete_file(request):
     target = (DOWNLOADS_DIR / rel).resolve()
     if not is_safe_path(target, DOWNLOADS_DIR):
         return web.json_response({"error": "forbidden"}, status=403)
-    if target.is_dir():
-        shutil.rmtree(target)
-    else:
-        target.unlink()
+    if target == DOWNLOADS_DIR.resolve():
+        return web.json_response({"error": "refusing to delete the library root"}, status=400)
+    if not target.exists():
+        return web.json_response({"error": "not found"}, status=404)
+    try:
+        if target.is_dir():
+            await asyncio.to_thread(shutil.rmtree, target)
+        else:
+            await asyncio.to_thread(target.unlink)
+    except OSError as e:
+        return web.json_response({"error": str(e)}, status=500)
     return web.json_response({"ok": True})
+
+
+def _write_zip(zip_path: Path, folder: Path):
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in folder.rglob("*"):
+            if f.is_file():
+                zf.write(f, f.relative_to(folder.parent))
 
 
 async def zip_folder(request):
@@ -1448,10 +1968,8 @@ async def zip_folder(request):
         return web.json_response({"error": "invalid"}, status=400)
 
     zip_path = folder.parent / f"{folder.name}.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in folder.rglob("*"):
-            if f.is_file():
-                zf.write(f, f.relative_to(folder.parent))
+    # Zipping a large folder on the event loop froze every client until it finished
+    await asyncio.to_thread(_write_zip, zip_path, folder)
 
     rel_zip = str(zip_path.relative_to(DOWNLOADS_DIR))
     return web.json_response({"ok": True, "zip_path": rel_zip})
@@ -1501,48 +2019,90 @@ async def get_status(request):
 async def save_config(request):
     global DEEZER_MAX_QUALITY
     body = await request.json()
-    arl = body.get("arl", "")
     quality = body.get("quality", "FLAC")
     spotify_id = body.get("spotify_id", "")
-    spotify_secret = body.get("spotify_secret", "")
     spotify_redirect = body.get("spotify_redirect", "")
 
+    # Refuse to write over a config we couldn't read — doing so would silently
+    # destroy the stored Spotify tokens and ARL
+    try:
+        existing_content = read_config_raw()
+    except ConfigUnreadableError as e:
+        return web.json_response({"error": str(e)}, status=409)
+
     # Keep existing tokens if not provided in the save (don't overwrite with empty)
-    existing_content = read_config_raw()
     spotify_access_token = get_val_from_content(existing_content, "access_token", "spotify")
     spotify_refresh_token = get_val_from_content(existing_content, "refresh_token", "spotify")
 
+    # Secrets come back from the UI masked when unchanged — keep what we have
+    arl = body.get("arl", "")
+    if arl == SECRET_MASK:
+        arl = get_val_from_content(existing_content, "arl", "deezer")
+    spotify_secret = body.get("spotify_secret", "")
+    if spotify_secret == SECRET_MASK:
+        spotify_secret = get_val_from_content(existing_content, "client_secret", "spotify")
+
     toml_content = f"""[deezer]
-arl = "{arl}"
+arl = "{toml_escape(arl)}"
 
 [spotify]
-client_id = "{spotify_id}"
-client_secret = "{spotify_secret}"
-redirect_uri = "{spotify_redirect}"
-access_token = "{spotify_access_token}"
-refresh_token = "{spotify_refresh_token}"
+client_id = "{toml_escape(spotify_id)}"
+client_secret = "{toml_escape(spotify_secret)}"
+redirect_uri = "{toml_escape(spotify_redirect)}"
+access_token = "{toml_escape(spotify_access_token)}"
+refresh_token = "{toml_escape(spotify_refresh_token)}"
 
 [downloads]
-folder = "{DOWNLOADS_DIR}"
-quality = "{quality}"
+folder = "{toml_escape(str(DOWNLOADS_DIR))}"
+quality = "{toml_escape(quality)}"
 """
     write_config_raw(toml_content)
-    DEEZER_MAX_QUALITY = None
+    DEEZER_MAX_QUALITY = None  # re-probe the account's quality ceiling
     return web.json_response({"ok": True})
+
+
+def set_val_in_content(content: str, key: str, section: str, value: str) -> str:
+    """Replace (or insert) a key in a TOML section without regex-escape hazards.
+
+    The value is passed through a callable replacement so backslashes in a token
+    are never interpreted as re.sub group references.
+    """
+    line = f'{key} = "{toml_escape(value)}"'
+    pattern = re.compile(
+        r'^(?P<indent>[ \t]*)' + re.escape(key) + r'\s*=\s*.*$', re.MULTILINE
+    )
+    if pattern.search(content):
+        return pattern.sub(lambda m: m.group("indent") + line, content, count=1)
+    header = f"[{section}]"
+    if header in content:
+        return content.replace(header, f"{header}\n{line}", 1)
+    return content.rstrip() + f"\n\n{header}\n{line}\n"
+
 
 def get_val_from_content(content, key, section):
     if not content: return ""
-    s_match = re.search(r'\[' + section + r'\](.*?)(?=\[|$)', content, re.DOTALL)
-    if s_match:
-        section_text = s_match.group(1)
-        m = re.search(key + r'\s*=\s*["' + "'" + r']([^"' + "'" + r']+)["' + "'" + r']', section_text)
-        if not m: m = re.search(key + r'\s*=\s*([^\s,]+)', section_text)
-        return m.group(1).strip() if m else ""
-    return ""
+    # Anchor the section end to a line-start bracket so a "[" inside a value
+    # (e.g. a folder path) doesn't truncate the section
+    s_match = re.search(
+        r'^\[' + re.escape(section) + r'\](.*?)(?=^\[|\Z)',
+        content, re.DOTALL | re.MULTILINE,
+    )
+    if not s_match:
+        return ""
+    section_text = s_match.group(1)
+    # Double-quoted, honouring backslash escapes written by toml_escape
+    m = re.search(re.escape(key) + r'\s*=\s*"((?:[^"\\]|\\.)*)"', section_text)
+    if m:
+        return toml_unescape(m.group(1)).strip()
+    m = re.search(re.escape(key) + r"\s*=\s*'([^']*)'", section_text)
+    if m:
+        return m.group(1).strip()
+    m = re.search(re.escape(key) + r'\s*=\s*([^\s,]+)', section_text)
+    return m.group(1).strip() if m else ""
 
 async def spotify_login(request):
     import urllib.parse
-    content = read_config_raw()
+    content = read_config_safe()
     client_id = get_val_from_content(content, "client_id", "spotify")
     if not client_id:
         return web.json_response({"error": "Spotify Client ID not configured"}, status=400)
@@ -1559,7 +2119,7 @@ async def spotify_login(request):
     logger.info(f"Spotify Login: Using client_id={client_id[:5]}..., redirect_uri={redirect_uri}")
     
     scope = "playlist-read-private playlist-read-collaborative user-library-read"
-    state = str(uuid.uuid4())
+    state = new_oauth_state()
 
     params = {
         "response_type": "code",
@@ -1578,8 +2138,19 @@ async def spotify_callback(request):
         return web.Response(text=f"Spotify Auth Error: {error}", status=400)
     if not code:
         return web.Response(text="No code received", status=400)
+    # The state we sent in /api/spotify/login must come back, or this callback
+    # wasn't started by us
+    if not consume_oauth_state(request.query.get("state", "")):
+        logger.warning("Spotify callback rejected: unknown or expired state")
+        return web.Response(
+            text="Invalid or expired OAuth state. Start the login again from Settings.",
+            status=400,
+        )
 
-    content = read_config_raw()
+    try:
+        content = read_config_raw()
+    except ConfigUnreadableError as e:
+        return web.Response(text=f"Cannot store tokens: {e}", status=409)
     client_id = get_val_from_content(content, "client_id", "spotify")
     client_secret = get_val_from_content(content, "client_secret", "spotify")
     config_redirect = get_val_from_content(content, "redirect_uri", "spotify")
@@ -1608,29 +2179,28 @@ async def spotify_callback(request):
             data = await resp.json()
             access_token = data.get("access_token")
             refresh_token = data.get("refresh_token")
-            logger.info(f"spotify_callback: Received access_token={access_token[:10]}..., refresh_token={refresh_token[:10] if refresh_token else 'NONE'}")
+            # Never log token material, even partially — these lines also reach
+            # the in-app log panel
+            logger.info(
+                f"spotify_callback: token exchange ok (refresh token issued: {bool(refresh_token)})"
+            )
+            if not access_token:
+                return web.Response(text="Spotify did not return an access token", status=400)
 
-            # Update config with new tokens
-            cfg_text = read_config_raw()
-            logger.info(f"spotify_callback: Current config length: {len(cfg_text)}")
-            # Surgical update to just tokens
-            if 'access_token =' in cfg_text:
-                new_cfg = re.sub(r'access_token\s*=\s*".*?"', f'access_token = "{access_token}"', cfg_text)
-            else:
-                new_cfg = cfg_text.replace('[spotify]', f'[spotify]\naccess_token = "{access_token}"')
-            
-            if 'refresh_token =' in new_cfg:
-                new_cfg = re.sub(r'refresh_token\s*=\s*".*?"', f'refresh_token = "{refresh_token}"', new_cfg)
-            else:
-                new_cfg = new_cfg.replace('access_token =', f'refresh_token = "{refresh_token}"\naccess_token =')
-                
+            # Surgical update to just the tokens
+            new_cfg = set_val_in_content(content, "access_token", "spotify", access_token)
+            # Spotify only issues a refresh token on the first consent — keep the
+            # existing one rather than writing the literal string "None"
+            if refresh_token:
+                new_cfg = set_val_in_content(new_cfg, "refresh_token", "spotify", refresh_token)
+
             write_config_raw(new_cfg)
             logger.info("spotify_callback: Config updated with new tokens")
 
     return web.Response(text="Successfully logged into Spotify! You can close this window and try your import again.", content_type="text/html")
 
 async def refresh_spotify_token(client_id, client_secret, refresh_token):
-    logger.info(f"Refreshing Spotify token using refresh_token: {refresh_token[:10]}...")
+    logger.info("Refreshing Spotify access token")
     auth_str = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     async with aiohttp.ClientSession() as session:
         async with session.post(
@@ -1641,11 +2211,17 @@ async def refresh_spotify_token(client_id, client_secret, refresh_token):
             if resp.status == 200:
                 data = await resp.json()
                 new_access = data.get("access_token")
+                if not new_access:
+                    logger.error("Spotify refresh returned no access token")
+                    return None
                 logger.info("Spotify token refresh successful")
                 # Save new token
-                cfg_text = read_config_raw()
-                new_cfg = re.sub(r'access_token\s*=\s*".*?"', f'access_token = "{new_access}"', cfg_text)
-                write_config_raw(new_cfg)
+                try:
+                    cfg_text = read_config_raw()
+                except ConfigUnreadableError as e:
+                    logger.error(f"Refreshed token could not be persisted: {e}")
+                    return new_access
+                write_config_raw(set_val_in_content(cfg_text, "access_token", "spotify", new_access))
                 return new_access
             else:
                 err = await resp.text()
@@ -1654,29 +2230,37 @@ async def refresh_spotify_token(client_id, client_secret, refresh_token):
 
 async def get_config(request):
     cfg = {"arl": "", "quality": "FLAC", "spotify_id": "", "spotify_secret": "", "deps": {}}
-    content = read_config_raw()
+    try:
+        content = read_config_raw()
+        cfg["config_readable"] = True
+    except ConfigUnreadableError as e:
+        content = ""
+        cfg["config_readable"] = False
+        cfg["config_error"] = str(e)
+
     if content:
-        cfg["arl"] = get_val_from_content(content, "arl", "deezer")
+        # Credentials are never returned in the clear: this endpoint is
+        # unauthenticated by default and the ARL is a full Deezer account
+        # credential. The UI posts the mask back when the value is unchanged.
+        arl = get_val_from_content(content, "arl", "deezer")
+        secret = get_val_from_content(content, "client_secret", "spotify")
+        cfg["arl"] = SECRET_MASK if arl else ""
+        cfg["arl_set"] = bool(arl)
+        cfg["spotify_secret"] = SECRET_MASK if secret else ""
+        cfg["spotify_secret_set"] = bool(secret)
         cfg["spotify_id"] = get_val_from_content(content, "client_id", "spotify")
-        cfg["spotify_secret"] = get_val_from_content(content, "client_secret", "spotify")
         cfg["spotify_redirect"] = get_val_from_content(content, "redirect_uri", "spotify")
+        cfg["spotify_logged_in"] = bool(get_val_from_content(content, "refresh_token", "spotify"))
 
         val_q = get_val_from_content(content, "quality", "downloads")
         if val_q: cfg["quality"] = val_q
-            
-    # Check dependencies
-    # Standard check
-    rip_path = shutil.which("rip")
-    # Fallback for pipx if not in immediate shutil path during runtime
-    if not rip_path:
-        pipx_rip = Path("/root/.local/bin/rip")
-        if pipx_rip.exists():
-            rip_path = str(pipx_rip)
 
-    cfg["deps"]["streamrip"] = rip_path is not None
+    cfg["deps"]["streamrip"] = find_rip() is not None
     cfg["deps"]["ytdlp"] = shutil.which("yt-dlp") is not None
+    cfg["deps"]["encryption"] = "fernet" if HAVE_FERNET else "xor-obfuscation"
+    cfg["auth_enabled"] = bool(AUTH_TOKEN)
     cfg["download_path"] = str(DOWNLOADS_DIR)
-    
+
     return web.json_response(cfg)
 
 
@@ -1692,15 +2276,50 @@ async def serve_index(request):
 
 async def on_startup(app):
     load_status()
-    asyncio.create_task(queue_worker())
+    load_staging()
+    chmod_private(KEY_FILE)
+    chmod_private(CONFIG_FILE)
+    # Legacy shared config held the ARL in plaintext at a predictable path
+    legacy_sr = CONFIG_DIR / "streamrip_config.toml"
+    if legacy_sr.exists():
+        try:
+            legacy_sr.unlink()
+        except OSError:
+            pass
+    if not HAVE_FERNET:
+        logger.warning(
+            "`cryptography` is not installed — config is only XOR-obfuscated, not "
+            "encrypted. Install it (see requirements.txt) for real encryption at rest."
+        )
+    if not AUTH_TOKEN:
+        logger.warning(
+            "MV_AUTH_TOKEN is not set — the API is unauthenticated. Anyone who can "
+            "reach this port can browse and delete the library."
+        )
+    app["queue_worker"] = asyncio.create_task(queue_worker())
     add_log("Music Vault server started")
-    DOWNLOAD_STATUS["library_size"] = get_folder_size(DOWNLOADS_DIR)
+    DOWNLOAD_STATUS["library_size"] = await get_library_size(force=True)
     await broadcast()
 
 
+async def on_shutdown(app):
+    # Don't leave yt-dlp / streamrip subprocesses running after we exit
+    for tid in list(ACTIVE_PROCS):
+        kill_download(tid)
+    task = app.get("queue_worker")
+    if task:
+        task.cancel()
+    for ws in list(WS_CLIENTS):
+        try:
+            await ws.close()
+        except Exception:
+            pass
+
+
 def create_app():
-    app = web.Application()
+    app = web.Application(middlewares=[auth_middleware])
     app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
 
     # Routes
     app.router.add_get("/ws/status", ws_handler)
@@ -1712,6 +2331,8 @@ def create_app():
     app.router.add_post("/api/download/playlist", download_playlist)
     app.router.add_post("/api/download/check", check_downloaded)
     app.router.add_post("/api/download/clear", clear_queue)
+    app.router.add_get("/api/staging", get_staging)
+    app.router.add_post("/api/staging", set_staging)
     app.router.add_post("/api/download/stop", stop_downloads)
     app.router.add_post("/api/download/pause", toggle_pause)
     app.router.add_post("/api/download/retry", retry_track)
@@ -1737,4 +2358,10 @@ def create_app():
 
 if __name__ == "__main__":
     app = create_app()
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("MV_PORT", 8081)))
+    # 0.0.0.0 by default because the container needs it; set MV_HOST=127.0.0.1
+    # to keep the server local-only when running directly on a host.
+    web.run_app(
+        app,
+        host=os.environ.get("MV_HOST", "0.0.0.0"),
+        port=int(os.environ.get("MV_PORT", 8081)),
+    )

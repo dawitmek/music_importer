@@ -18,9 +18,9 @@ RUN apt-get update && apt-get install -y \
 # Set locale
 RUN sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen && \
     locale-gen
-ENV LANG en_US.UTF-8
-ENV LANGUAGE en_US:en
-ENV LC_ALL en_US.UTF-8
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
 ENV PATH="/root/.local/bin:${PATH}"
 
 # Upgrade pip
@@ -40,9 +40,12 @@ RUN pipx install streamrip
 COPY server.py .
 COPY index.html .
 COPY static/ ./static/
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
 
 RUN mkdir -p downloads/singles downloads/playlists data/logs
 
 EXPOSE 8081
 
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["python", "server.py"]

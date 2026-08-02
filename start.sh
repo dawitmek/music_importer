@@ -48,15 +48,37 @@ done
 print_banner
 
 # ── Check/kill existing process on port ───────────────────────────────────────
+# Only ever reclaims the port from a previous Music Vault. Anything else on the
+# port is reported, not killed — this used to SIGKILL whatever happened to be
+# listening, and SIGKILL also denied the server a chance to flush its state.
 cleanup_port() {
-  local pid
-  pid=$(lsof -ti ":${PORT}" 2>/dev/null || true)
-  if [[ -n "$pid" ]]; then
-    warn "Port ${PORT} in use by PID ${pid} — killing…"
-    kill -9 $pid 2>/dev/null || true
-    sleep 1
-    log "Port ${PORT} freed"
-  fi
+  local pids pid cmdline killed=false
+  pids=$(lsof -ti ":${PORT}" 2>/dev/null || true)
+  [[ -z "$pids" ]] && return 0
+
+  for pid in $pids; do
+    cmdline=$(ps -o command= -p "$pid" 2>/dev/null || true)
+    if [[ "$cmdline" == *"server.py"* ]]; then
+      warn "Port ${PORT} held by a previous Music Vault (PID ${pid}) — stopping…"
+      kill -TERM "$pid" 2>/dev/null || true
+      for _ in 1 2 3 4 5 6 7 8 9 10; do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.5
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        warn "PID ${pid} did not exit — forcing"
+        kill -9 "$pid" 2>/dev/null || true
+      fi
+      killed=true
+    else
+      err "Port ${PORT} is in use by PID ${pid} (${cmdline:-unknown}), which is not Music Vault."
+      err "Refusing to kill it. Use --port to pick another port, or stop that process yourself."
+      exit 1
+    fi
+  done
+
+  $killed && log "Port ${PORT} freed"
+  return 0
 }
 
 # ── Create directories ─────────────────────────────────────────────────────────
