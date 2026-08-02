@@ -2139,6 +2139,30 @@ select.config-input option {
 
 .hidden { display: none !important; }
 
+/* ── Failed Downloads ── */
+.failed-title::before {
+  background: var(--rose) !important;
+  box-shadow: 0 0 12px var(--rose) !important;
+}
+.failed-count {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--rose);
+  background: var(--rose-glow);
+  border: 1px solid var(--rose);
+  border-radius: 10px;
+  padding: 2px 8px;
+  letter-spacing: 0;
+}
+.q-failed-time {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  color: var(--dim);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
 /* ── Global Queue Bar ── */
 .queue-bar {
   position: sticky;

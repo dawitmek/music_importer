@@ -221,10 +221,10 @@ function updateUI(s){
   const badge=document.getElementById('queue-badge');
   badge.textContent=total;badge.classList.toggle('hidden',total===0);
   document.getElementById('ws-dot').className=a.length>0?'conn-dot downloading':'conn-dot connected';
+  renderFailed(f);
   const all=[
     ...a.map(x=>({...x,_cat:'active'})),...q.map(x=>({...x,_cat:'queue'})),
-    ...c.slice(-10).reverse().map(x=>({...x,_cat:'done'})),
-    ...f.slice(-5).reverse().map(x=>({...x,_cat:'fail'}))
+    ...c.slice(-10).reverse().map(x=>({...x,_cat:'done'}))
   ];
   const ql=document.getElementById('queue-list');
   ql.innerHTML = '';
@@ -268,6 +268,51 @@ function updateUI(s){
     ql.appendChild(qItem);
   });
   updateLogs(s.logs||[]);
+}
+
+// Failed tracks live in their own list, served from the server's persisted
+// status.json — they survive page reloads and server restarts.
+function renderFailed(failed){
+  const card = document.getElementById('failed-card');
+  const list = document.getElementById('failed-list');
+  if(!card || !list) return;
+
+  card.classList.toggle('hidden', !failed.length);
+  document.getElementById('failed-count').textContent = failed.length;
+  if(!failed.length){ list.innerHTML=''; return; }
+
+  list.innerHTML = '';
+  failed.slice().reverse().forEach((item, idx) => {
+    const el = document.createElement('div');
+    el.className = 'queue-item failed';
+    el.style.animationDelay = `${idx*.04}s`;
+    const when = item.finished_at
+      ? new Date(item.finished_at*1000).toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'})
+      : '';
+    el.innerHTML = `
+      <img class="q-cover" src="${item.cover || `/api/track-cover?artist=${enc(item.artist)}&title=${enc(item.title)}`}" onerror="this.src='/api/track-cover'" loading="lazy"/>
+      <div class="q-info"><div class="q-title">${esc(item.title)}</div><div class="q-artist">${esc(item.artist||'—')}</div></div>
+      <span class="q-failed-time">${when}</span>
+      <div class="q-actions"></div>
+    `;
+
+    const actions = el.querySelector('.q-actions');
+    const retryBtn = document.createElement('button');
+    retryBtn.className = 'q-retry-btn';
+    retryBtn.innerHTML = '↻';
+    retryBtn.title = 'Retry download';
+    retryBtn.addEventListener('click', () => retryTrack(item.id));
+    actions.appendChild(retryBtn);
+
+    const dismissBtn = document.createElement('button');
+    dismissBtn.className = 'q-stop-btn';
+    dismissBtn.innerHTML = '✕';
+    dismissBtn.title = 'Dismiss from failed list';
+    dismissBtn.addEventListener('click', () => removeFromQueue(item.id));
+    actions.appendChild(dismissBtn);
+
+    list.appendChild(el);
+  });
 }
 
 async function removeFromQueue(id){
@@ -869,6 +914,11 @@ document.getElementById('qb-clear').addEventListener('click',queueClear);
 document.getElementById('qb-stop').addEventListener('click',queueStop);
 document.getElementById('qb-pause').addEventListener('click',queueTogglePause);
 document.getElementById('qb-retry').addEventListener('click',queueRetryFailed);
+document.getElementById('retry-all-failed-btn').addEventListener('click',queueRetryFailed);
+document.getElementById('clear-failed-btn').addEventListener('click',async()=>{
+  await fetch('/api/download/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({failed:true})});
+  toast('Failed list cleared','info');
+});
 
 // ── Files ────────────────────────────────
 async function loadFiles(path=currentPath){

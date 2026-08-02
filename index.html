@@ -150,6 +150,20 @@
                 <div style="color:var(--dim);font-size:12px;padding:14px;font-family:'JetBrains Mono',monospace;letter-spacing:1px">— queue is empty —</div>
               </div>
             </div>
+
+            <!-- FAILED DOWNLOADS — server-persisted, survives restarts -->
+            <div class="card hidden" id="failed-card">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+                <div class="card-title failed-title" style="margin:0">
+                  Failed Downloads <span class="failed-count" id="failed-count">0</span>
+                </div>
+                <div style="display:flex;gap:8px">
+                  <button class="btn btn-ghost btn-sm" id="retry-all-failed-btn" style="color:var(--emerald)">↻ Retry All</button>
+                  <button class="btn btn-ghost btn-sm" id="clear-failed-btn" style="color:var(--rose)">✕ Clear List</button>
+                </div>
+              </div>
+              <div class="queue-list" id="failed-list"></div>
+            </div>
           </div>
 
           <aside class="importer-sidebar">

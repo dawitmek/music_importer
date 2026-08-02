@@ -1215,7 +1215,16 @@ async def clear_queue(request):
     except Exception:
         pass
     clear_all = body.get("all", False)
+    failed_only = body.get("failed", False)
     async with DOWNLOAD_LOCK:
+        # The failed list is managed independently of the queue, so clearing it
+        # must not discard pending tracks or reset batch progress
+        if failed_only:
+            DOWNLOAD_STATUS["failed"] = []
+            save_status()
+            await broadcast()
+            return web.json_response({"ok": True})
+
         DOWNLOAD_STATUS["queue"] = []
         DOWNLOAD_STATUS["batch_total"] = 0
         DOWNLOAD_STATUS["batch_completed"] = 0
@@ -1246,7 +1255,12 @@ async def remove_from_queue(request):
             original_active_len = len(DOWNLOAD_STATUS["active"])
             DOWNLOAD_STATUS["active"] = [x for x in DOWNLOAD_STATUS["active"] if x["id"] != tid]
             removed = removed or (len(DOWNLOAD_STATUS["active"]) < original_active_len)
-            
+
+            # Also dismiss individual entries from the failed list
+            original_failed_len = len(DOWNLOAD_STATUS["failed"])
+            DOWNLOAD_STATUS["failed"] = [x for x in DOWNLOAD_STATUS["failed"] if x["id"] != tid]
+            removed = removed or (len(DOWNLOAD_STATUS["failed"]) < original_failed_len)
+
             if removed:
                 save_status()
                 
