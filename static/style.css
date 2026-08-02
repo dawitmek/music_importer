@@ -614,6 +614,10 @@ body {
   /* .card clips with overflow:hidden — the history and suggestion dropdowns
      are absolutely positioned and hang past the card's bottom edge */
   overflow: visible !important;
+  /* .card's backdrop-filter makes each card a stacking context, so the
+     dropdowns' own z-index only ranks them within this card. Lift the whole
+     card above the cards that follow it, but below the sticky queue bar. */
+  z-index: 60;
 }
 /* The glow relied on the card's clipping to follow its rounded corner */
 .hero-search .card-glow {
