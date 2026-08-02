@@ -1723,4 +1723,4 @@ def create_app():
 
 if __name__ == "__main__":
     app = create_app()
-    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("MV_PORT", 8080)))
+    web.run_app(app, host="0.0.0.0", port=int(os.environ.get("MV_PORT", 8081)))

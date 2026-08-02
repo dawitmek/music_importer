@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────────────
 # Music Vault Startup Orchestrator
-# Usage: ./start.sh [--port 8080] [--dev]
+# Usage: ./start.sh [--port 8081] [--dev]
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PORT="${MV_PORT:-8080}"
+PORT="${MV_PORT:-8081}"
 DEV_MODE=false
 VENV_DIR=".venv"
 

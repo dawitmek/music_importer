@@ -43,6 +43,6 @@ COPY static/ ./static/
 
 RUN mkdir -p downloads/singles downloads/playlists data/logs
 
-EXPOSE 8080
+EXPOSE 8081
 
 CMD ["python", "server.py"]

@@ -42,7 +42,7 @@ chmod +x start.sh
 ./start.sh --port 9000
 ```
 
-Open **http://localhost:8080**
+Open **http://localhost:8081**
 
 ---
 
@@ -138,5 +138,5 @@ Music Vault encrypts the sensitive configuration (like the Deezer ARL) using a l
 | Variable | Description | Default |
 |---|---|---|
 | `DEEZER_ARL` | Deezer ARL cookie | (empty) |
-| `VV_PORT` | Server port | `8080` |
+| `MV_PORT` | Server port | `8081` |
 # music_vault_v2
