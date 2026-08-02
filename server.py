@@ -795,8 +795,8 @@ async def search_playlist(request):
         if not url:
             return web.json_response({"error": "No URL provided"}, status=400)
 
-        # Handle Spotify specifically
-        if "spotify.com" in url and "playlist" in url:
+        # Handle Spotify specifically (playlists and albums share the same embed shape)
+        if "spotify.com" in url and re.search(r'(playlist|album)/[a-zA-Z0-9]+', url):
             return await handle_spotify_playlist(url)
 
         # For YouTube and others, get playlist title first.
@@ -880,12 +880,12 @@ async def search_playlist(request):
 
 async def handle_spotify_playlist(url):
     try:
-        playlist_id = re.search(r'playlist/([a-zA-Z0-9]+)', url).group(1)
+        kind, playlist_id = re.search(r'(playlist|album)/([a-zA-Z0-9]+)', url).groups()
 
         # Optimization: Parse the public playlist embed first.
-        # This allows us to fetch track metadata for small playlists (<= 99 tracks) 
+        # This allows us to fetch track metadata for small playlists (<= 99 tracks)
         # without requiring any Spotify API authentication or user login.
-        embed_url = f"https://open.spotify.com/embed/playlist/{playlist_id}"
+        embed_url = f"https://open.spotify.com/embed/{kind}/{playlist_id}"
         headers = {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
 
         async with aiohttp.ClientSession(headers=headers) as session:
@@ -905,9 +905,14 @@ async def handle_spotify_playlist(url):
 
         # Get playlist cover
         playlist_cover = ""
-        sources = entity.get('coverArt', {}).get('sources', [])
+        sources = (entity.get('coverArt') or {}).get('sources', [])
         if sources:
             playlist_cover = sources[0].get('url', '')
+        else:
+            # Albums carry no coverArt — the artwork lives under visualIdentity
+            images = (entity.get('visualIdentity') or {}).get('image', [])
+            if images:
+                playlist_cover = max(images, key=lambda i: i.get('maxHeight', 0)).get('url', '')
 
         tracks = []
         for t in track_list:
@@ -917,14 +922,15 @@ async def handle_spotify_playlist(url):
             tracks.append({
                 "title": clean_track_title(t.get("title", "Unknown")),
                 "artist": t.get("subtitle", "Unknown Artist"),
-                "album": "",
+                "album": playlist_name if kind == "album" else "",
                 "duration": t.get("duration", 0) / 1000,
                 "cover": t_cover,
                 "id": t.get("uri", "").split(":")[-1]
             })
 
-        # If the playlist is small, return the scraped tracks immediately
-        if len(tracks) <= 99:
+        # If the playlist is small, return the scraped tracks immediately.
+        # Albums always take this path — the API fallback below is playlist-only.
+        if len(tracks) <= 99 or kind == "album":
             return web.json_response({"tracks": tracks, "title": playlist_name})
 
         # If the playlist is large (100+ tracks), we MUST use the Spotify Web API 
