@@ -472,6 +472,65 @@ document.getElementById('clear-history-btn').addEventListener('click', (e)=>{
     renderHistory();
 });
 
+// ── Clipboard paste button ───────────────
+const pasteBtn=document.getElementById('search-paste');
+// null = nothing to offer; a string = the button label to show
+let pasteLabel=null;
+
+// Matches what handleSearchSubmit() treats as a fetchable URL, so the label
+// never promises a link fetch the submit path won't do
+function looksLikeLink(text){
+    const t=text.trim();
+    if(!t || /\s/.test(t) || !t.startsWith('http')) return false;
+    try{
+        const u=new URL(t);
+        return (u.protocol==='http:'||u.protocol==='https:') && u.hostname.includes('.');
+    }catch{ return false; }
+}
+
+function renderPasteBtn(){
+    if(pasteLabel===null){
+        pasteBtn.classList.add('hidden');
+        return;
+    }
+    pasteBtn.textContent=pasteLabel;
+    pasteBtn.classList.remove('hidden');
+}
+
+async function refreshPasteBtn(){
+    if(!navigator.clipboard || !navigator.clipboard.readText){ pasteLabel=null; renderPasteBtn(); return; }
+    let text=null;
+    try{
+        // Peeking at the contents is only allowed once permission is granted;
+        // elsewhere (Safari/Firefox, or before the first grant) we offer a generic button
+        const perm=navigator.permissions && await navigator.permissions.query({name:'clipboard-read'});
+        if(perm && perm.state==='granted') text=await navigator.clipboard.readText();
+    }catch{ /* clipboard-read isn't a queryable permission here */ }
+    if(text===null) pasteLabel='📋 Paste';
+    else if(!text.trim()) pasteLabel=null;
+    else pasteLabel=looksLikeLink(text) ? '📋 Paste link' : '📋 Paste';
+    renderPasteBtn();
+}
+
+pasteBtn.addEventListener('click',async()=>{
+    let text='';
+    try{ text=await navigator.clipboard.readText(); }
+    catch{ statusEl.textContent='Clipboard access blocked — paste with ⌘V / Ctrl+V.'; sInput.focus(); return; }
+    if(!text.trim()){
+        statusEl.textContent='Clipboard is empty.';
+        pasteLabel=null; renderPasteBtn();
+        return;
+    }
+    sInput.value=text.trim();
+    sInput.focus();
+    sInput.dispatchEvent(new Event('input'));
+    refreshPasteBtn();
+});
+
+window.addEventListener('focus',refreshPasteBtn);
+document.addEventListener('visibilitychange',()=>{ if(!document.hidden) refreshPasteBtn(); });
+refreshPasteBtn();
+
 sInput.addEventListener('input',()=>{
   clearTimeout(sTimeout);
   const q=sInput.value.trim();

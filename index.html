@@ -7,7 +7,7 @@
 <link rel="icon" type="image/png" href="/static/assets/musical-note.png"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;900&family=Outfit:wght@300;400;500;600&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet"/>
-<link rel="stylesheet" href="/static/style.css"/>
+<link rel="stylesheet" href="/static/style.css?v=1.0.2"/>
 </head>
 <body>
 <canvas id="bg-canvas"></canvas>
@@ -97,6 +97,7 @@
                 <input type="text" class="search-input main-search" id="search-q" placeholder="What do you want to listen to?" autocomplete="off"/>
                 <button class="search-btn main-search-btn" id="search-submit">⌕</button>
               </div>
+              <button type="button" class="btn btn-ghost paste-btn hidden" id="search-paste" title="Paste from clipboard">📋 Paste</button>
               <button class="btn btn-ghost" id="history-toggle-btn" title="Search History" style="padding:0;width:54px;justify-content:center;font-size:20px">🕒</button>
             </div>
             <div class="suggestions hidden" id="suggestions"></div>
@@ -343,7 +344,7 @@
           <div class="card-title">System Info</div>
           <div class="sysinfo-grid">
             <div class="sysinfo-row">Downloads: <span id="cfg-dl-path">/downloads</span></div>
-            <div class="sysinfo-row">Version: <span>Music Vault 1.1.0</span></div>
+            <div class="sysinfo-row">Version: <span>Music Vault 1.2.0</span></div>
             <div id="dep-streamrip" class="sysinfo-row">streamrip: <span style="color:var(--dim)">checking…</span></div>
             <div id="dep-ytdlp" class="sysinfo-row">yt-dlp: <span style="color:var(--dim)">checking…</span></div>
             <div id="dep-security" class="sysinfo-row">config: <span style="color:var(--dim)">checking…</span></div>
@@ -448,7 +449,7 @@
 </div>
 
 <div class="toast-container" id="toasts"></div>
-<script src="/static/script.js?v=1.0.1"></script>
+<script src="/static/script.js?v=1.0.2"></script>
 </body>
 </html>
 

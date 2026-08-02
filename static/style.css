@@ -652,6 +652,16 @@ body {
   transform: translateY(-50%) scale(1.05) !important;
   box-shadow: 0 12px 32px var(--cyan-glow) !important;
 }
+/* Sits in the search row, left of the history button, and stretches to match it */
+.paste-btn {
+  padding: 0 18px;
+  justify-content: center;
+  white-space: nowrap;
+}
+.paste-btn:hover {
+  border-color: var(--cyan);
+  color: #fff;
+}
 
 /* ── Dashboard Mini ── */
 .dashboard-mini {
@@ -2112,6 +2122,10 @@ select.config-input option {
   .main-search-btn {
     width: 48px !important;
     height: 48px !important;
+  }
+  .paste-btn {
+    padding: 0 12px;
+    font-size: 12px;
   }
 
   .dashboard-mini {
