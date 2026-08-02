@@ -15,13 +15,13 @@
       r:Math.random()*1.2+.2,a:Math.random(),
       da:(Math.random()-.5)*.007,
       dx:(Math.random()-.5)*.06,
-      col:Math.random()>.85?'#00d4ff':Math.random()>.7?'#ffc837':'#c8d8e8'
+      col:Math.random()>.85?'#00f2ff':Math.random()>.7?'#ffcf4d':'#cbd5e1'
     });
     nebulae=[];
     for(let i=0;i<5;i++) nebulae.push({
       x:Math.random()*W,y:Math.random()*H,
       r:100+Math.random()*220,
-      c:i%2===0?'rgba(0,212,255,':'rgba(255,200,55,',
+      c:i%2===0?'rgba(0,242,255,':'rgba(255,207,77,',
       a:.018+Math.random()*.025
     });
   }

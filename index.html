@@ -17,14 +17,14 @@
 <div class="app">
   <header class="mobile-header">
     <div class="logo">
-      <div class="logo-title"><span class="logo-text-m">Music</span><span class="logo-text-v">Vault</span></div>
+      <div class="logo-title">Music Vault</div>
     </div>
   </header>
   <div class="main-area">
 
     <aside class="sidebar">
       <div class="logo">
-        <div class="logo-title"><span class="logo-text-m">Music</span><span class="logo-text-v">Vault</span></div>
+        <div class="logo-title">Music Vault</div>
         <div class="logo-sub">Music Library</div>
       </div>
       <nav class="nav">
@@ -59,69 +59,24 @@
       <!-- IMPORTER -->
       <section class="tab-panel active" id="tab-importer">
         <div class="page-header">
-          <div class="section-title">Quick <span>Importer</span></div>
+          <div class="section-title">Music <span>Vault</span></div>
           <div class="section-sub">Search Deezer or enter manually — stage tracks, then sync.</div>
         </div>
-        <div class="dashboard">
-          <div class="dash-card">
-            <div class="dash-label">Library Size</div>
-            <div class="dash-main">
-              <div class="dash-val" id="dash-storage-val" style="font-size:24px; color:var(--cyan)">0 B</div>
-            </div>
-            <div class="dash-sub" id="dash-storage-text">Disk storage</div>
-          </div>
-          <div class="dash-card">
-            <div class="dash-label">Batch Progress</div>
-            <div class="dash-main batch-stats">
-              <div class="batch-progress">
-                <div class="batch-val" id="dash-batch-pct" style="font-size:24px;">0%</div>
-                <div class="dash-bar"><div class="dash-fill" id="dash-batch-fill"></div></div>
-                <div class="batch-label" id="dash-batch-text">Batch: 0 / 0</div>
-              </div>
-            </div>
-          </div>
-          <div class="dash-card">
-            <div class="dash-label">Session Summary</div>
-            <div class="session-summary">
-              <div class="sess-item"><div class="sess-val" id="dash-done">0</div><div class="sess-lab">DONE</div></div>
-              <div class="sess-item"><div class="sess-val" id="dash-fail" style="color:var(--rose)">0</div><div class="sess-lab">FAIL</div></div>
-            </div>
-          </div>
-          <div class="dash-card">
-            <div class="dash-label">Last Complete</div>
-            <div class="dash-main">
-              <div class="dash-val" id="dash-last-complete" style="font-size:18px; color:var(--emerald)">Never</div>
-            </div>
-            <div class="dash-sub">Finished at</div>
-          </div>
-        </div>
-        <div class="dashboard" style="grid-template-columns: 1fr; margin-top: -10px;">
-          <div class="dash-card" style="min-height: 80px;">
-            <div class="dash-label">System Status</div>
-            <div style="display:flex; align-items:center; gap:16px; flex:1; min-width:0;">
-              <img id="dash-status-cover" src="/api/track-cover" alt="Status" style="width:52px; height:52px; border-radius:6px; object-fit:cover; border:1px solid var(--border); display:none; flex-shrink:0;"/>
-              <div id="dash-status-main" style="flex:1; display:flex; flex-direction:column; justify-content:center; min-width:0;">
-                <div id="dash-status-title" style="font-family:'Barlow Condensed', sans-serif; font-size:22px; font-weight:700; color:var(--muted); letter-spacing:1px; text-transform:uppercase;">IDLE</div>
-                <div id="dash-status-detail" style="font-size:14px; color:var(--text); margin-top:4px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">Waiting for tracks...</div>
-              </div>
-              <div id="dash-status-sub" style="font-size:13px; font-weight:700; color:var(--cyan); background:var(--cyan-dim); padding:4px 10px; border-radius:4px; border:1px solid var(--cyan-glow);">Ready</div>
-            </div>
-          </div>
-        </div>
-        <div class="card search-card">
+
+        <!-- HERO SEARCH AREA -->
+        <div class="card search-card hero-search">
           <div class="card-glow"></div>
-          <div class="card-title">Search &amp; Stage</div>
           <div class="search-mode-toggle">
             <button class="mode-btn active" id="mode-search">🔍 Search</button>
             <button class="mode-btn" id="mode-manual">✏ Manual</button>
           </div>
           <div id="search-area" class="search-area">
-            <div style="display:flex;gap:8px;margin-bottom:12px">
+            <div style="display:flex;gap:12px;margin-bottom:12px">
               <div style="position:relative;flex:1">
-                <input type="text" class="search-input" id="search-q" placeholder="Search artist, track... or paste playlist URL" autocomplete="off"/>
-                <button class="search-btn" id="search-submit">⌕</button>
+                <input type="text" class="search-input main-search" id="search-q" placeholder="What do you want to listen to?" autocomplete="off"/>
+                <button class="search-btn main-search-btn" id="search-submit">⌕</button>
               </div>
-              <button class="btn btn-ghost" id="history-toggle-btn" title="Search History" style="padding:0;width:44px;justify-content:center;font-size:18px">🕒</button>
+              <button class="btn btn-ghost" id="history-toggle-btn" title="Search History" style="padding:0;width:54px;justify-content:center;font-size:20px">🕒</button>
             </div>
             <div class="suggestions hidden" id="suggestions"></div>
             <div id="history-panel" class="history-panel hidden">
@@ -138,35 +93,87 @@
               <div><label class="config-label">Artist</label><input type="text" class="config-input" id="m-artist" placeholder="Artist name"/></div>
               <div><label class="config-label">Title</label><input type="text" class="config-input" id="m-title" placeholder="Track title"/></div>
             </div>
-            <button class="btn btn-ghost btn-sm" id="add-manual">+ Add to Staging</button>
+            <button class="btn btn-gold btn-sm" id="add-manual">+ Add to Staging</button>
           </div>
         </div>
-        <div class="card">
-          <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
-            <span>Staging Area</span>
-            <button class="btn btn-ghost btn-sm" id="toggle-staging-expand" style="padding: 4px 8px; font-size: 11px;">⤢ Expand</button>
-          </div>
-          <div class="staging" id="staging"><div class="staging-empty">No tracks staged — search and add songs above</div></div>
-          <div class="staging-actions">
-            <span class="staging-count" id="staging-count">0 tracks staged</span>
-            <button class="btn btn-ghost btn-sm" id="remove-selected" style="display:none; color: var(--rose);">🗑 Remove Selected</button>
-            <button class="btn btn-ghost btn-sm" id="clear-staging">✕ Clear</button>
-            <button class="btn btn-gold" id="sync-all">⚡ Sync All</button>
-          </div>
-        </div>
-        <div class="card">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
-            <div class="card-title" style="margin:0">Download Queue</div>
-            <div style="display:flex;gap:8px">
-              <button class="btn btn-ghost btn-sm" id="retry-failed-btn" style="color:var(--emerald)">↻ Retry Failed</button>
-              <button class="btn btn-ghost btn-sm" id="pause-queue-btn" style="color:var(--gold)">⏸ Pause Queue</button>
-              <button class="btn btn-danger btn-sm" id="stop-queue-btn">Stop Queue</button>
-              <button class="btn btn-ghost btn-sm" id="clear-queue-btn">Clear Queue</button>
+
+        <div class="importer-layout">
+          <div class="importer-main">
+            <div class="card">
+              <div class="card-title" style="display:flex; justify-content:space-between; align-items:center;">
+                <span>Staging Area</span>
+                <div style="display:flex; gap:8px;">
+                   <button class="btn btn-ghost btn-sm" id="toggle-staging-expand" style="padding: 4px 8px; font-size: 11px;">⤢ Expand</button>
+                </div>
+              </div>
+              <div class="staging" id="staging"><div class="staging-empty">No tracks staged — search and add songs above</div></div>
+              <div class="staging-actions">
+                <span class="staging-count" id="staging-count">0 tracks staged</span>
+                <button class="btn btn-ghost btn-sm" id="remove-selected" style="display:none; color: var(--rose);">🗑 Remove Selected</button>
+                <button class="btn btn-ghost btn-sm" id="clear-staging">✕ Clear</button>
+                <button class="btn btn-gold" id="sync-all">⚡ Sync All</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px">
+                <div class="card-title" style="margin:0">Download Queue</div>
+                <div style="display:flex;gap:8px">
+                  <button class="btn btn-ghost btn-sm" id="retry-failed-btn" style="color:var(--emerald)">↻ Retry Failed</button>
+                  <button class="btn btn-ghost btn-sm" id="pause-queue-btn" style="color:var(--gold)">⏸ Pause Queue</button>
+                  <button class="btn btn-danger btn-sm" id="stop-queue-btn">Stop Queue</button>
+                  <button class="btn btn-ghost btn-sm" id="clear-queue-btn">Clear Queue</button>
+                </div>
+              </div>
+              <div class="queue-list" id="queue-list">
+                <div style="color:var(--dim);font-size:12px;padding:14px;font-family:'JetBrains Mono',monospace;letter-spacing:1px">— queue is empty —</div>
+              </div>
             </div>
           </div>
-          <div class="queue-list" id="queue-list">
-            <div style="color:var(--dim);font-size:12px;padding:14px;font-family:'JetBrains Mono',monospace;letter-spacing:1px">— queue is empty —</div>
-          </div>
+
+          <aside class="importer-sidebar">
+            <!-- SYSTEM STATUS -->
+            <div class="dash-card status-card">
+              <div class="dash-label">System Status</div>
+              <div style="display:flex; flex-direction:column; gap:12px; flex:1;">
+                <div style="display:flex; align-items:center; gap:12px;">
+                  <img id="dash-status-cover" src="/api/track-cover" alt="Status" style="width:48px; height:48px; border-radius:6px; object-fit:cover; border:1px solid var(--border); display:none; flex-shrink:0;"/>
+                  <div id="dash-status-main" style="flex:1; display:flex; flex-direction:column; min-width:0;">
+                    <div id="dash-status-title" style="font-family:'Barlow Condensed', sans-serif; font-size:18px; font-weight:700; color:var(--muted); letter-spacing:1px; text-transform:uppercase;">IDLE</div>
+                    <div id="dash-status-sub" style="font-size:11px; font-weight:700; color:var(--muted); margin-top:2px;">READY</div>
+                  </div>
+                </div>
+                <div id="dash-status-detail" style="font-size:12px; color:var(--text); white-space:nowrap; overflow:hidden; text-overflow:ellipsis; opacity:0.8;">Waiting for tracks...</div>
+              </div>
+            </div>
+
+            <!-- STATS -->
+            <div class="dashboard-mini">
+              <div class="dash-card">
+                <div class="dash-label">Library</div>
+                <div class="dash-val" id="dash-storage-val" style="font-size:20px; color:var(--cyan)">0 B</div>
+              </div>
+              <div class="dash-card">
+                <div class="dash-label">Progress</div>
+                <div class="batch-progress">
+                  <div class="batch-val" id="dash-batch-pct" style="font-size:20px;">0%</div>
+                  <div class="dash-bar"><div class="dash-fill" id="dash-batch-fill"></div></div>
+                  <div class="batch-label" id="dash-batch-text" style="font-size:9px; margin-top:4px;">Batch: 0 / 0</div>
+                </div>
+              </div>
+              <div class="dash-card">
+                <div class="dash-label">Session</div>
+                <div class="session-summary">
+                  <div class="sess-item"><div class="sess-val" id="dash-done" style="font-size:20px;">0</div><div class="sess-lab">DONE</div></div>
+                  <div class="sess-item"><div class="sess-val" id="dash-fail" style="font-size:20px; color:var(--rose)">0</div><div class="sess-lab">FAIL</div></div>
+                </div>
+              </div>
+              <div class="dash-card">
+                <div class="dash-label">Last Batch</div>
+                <div class="dash-val" id="dash-last-complete" style="font-size:14px; color:var(--emerald)">Never</div>
+              </div>
+            </div>
+          </aside>
         </div>
       </section>
 
