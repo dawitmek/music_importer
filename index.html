@@ -56,6 +56,27 @@
 
     <main class="content">
 
+      <!-- GLOBAL QUEUE CONTROLS — sticky, shown on every tab while the queue is busy -->
+      <div class="queue-bar hidden" id="queue-bar">
+        <div class="queue-bar-status">
+          <span class="queue-bar-dot" id="queue-bar-dot"></span>
+          <div class="queue-bar-text">
+            <div class="queue-bar-title" id="queue-bar-title">IDLE</div>
+            <div class="queue-bar-detail" id="queue-bar-detail">—</div>
+          </div>
+        </div>
+        <div class="queue-bar-progress">
+          <div class="queue-bar-bar"><div class="queue-bar-fill" id="queue-bar-fill"></div></div>
+          <div class="queue-bar-count" id="queue-bar-count">0 / 0</div>
+        </div>
+        <div class="queue-bar-actions">
+          <button class="btn btn-ghost btn-sm" id="qb-pause">⏸ Pause</button>
+          <button class="btn btn-ghost btn-sm" id="qb-retry" style="color:var(--emerald)">↻ Retry</button>
+          <button class="btn btn-danger btn-sm" id="qb-stop">■ Stop</button>
+          <button class="btn btn-ghost btn-sm" id="qb-clear">✕ Clear</button>
+        </div>
+      </div>
+
       <!-- IMPORTER -->
       <section class="tab-panel active" id="tab-importer">
         <div class="page-header">

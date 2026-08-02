@@ -87,6 +87,49 @@ function connectWS(){
   };
 }
 
+// Global queue bar — mirrors the Download Queue card's controls on every tab.
+// Only shown when there is something to act on, so it stays out of the way when idle.
+function updateQueueBar(s, q, a, f, batchDone, batchTotal, batchPct){
+  const bar = document.getElementById('queue-bar');
+  if(!bar) return;
+
+  const busy = a.length + q.length;
+  bar.classList.toggle('hidden', busy === 0 && !f.length);
+  bar.classList.toggle('running', busy > 0 && !s.is_paused);
+  bar.classList.toggle('paused', !!s.is_paused);
+
+  const title = document.getElementById('queue-bar-title');
+  const detail = document.getElementById('queue-bar-detail');
+  if(s.is_paused){
+    title.textContent = 'PAUSED';
+    title.style.color = 'var(--cyan)';
+  } else if(a.length){
+    title.textContent = 'DOWNLOADING';
+    title.style.color = 'var(--gold)';
+  } else if(q.length){
+    title.textContent = 'QUEUED';
+    title.style.color = 'var(--cyan)';
+  } else {
+    title.textContent = f.length ? 'FAILED' : 'IDLE';
+    title.style.color = f.length ? 'var(--rose)' : 'var(--muted)';
+  }
+
+  const current = a[0] || q[0];
+  if(current){
+    detail.textContent = `${current.artist} - ${current.title}`;
+  } else {
+    detail.textContent = f.length ? `${f.length} failed track${f.length>1?'s':''}` : '—';
+  }
+
+  document.getElementById('queue-bar-fill').style.width = `${batchPct}%`;
+  document.getElementById('queue-bar-count').textContent = `${batchDone} / ${batchTotal}`;
+
+  const qbPause = document.getElementById('qb-pause');
+  qbPause.innerHTML = s.is_paused ? '▶ Resume' : '⏸ Pause';
+  qbPause.style.color = s.is_paused ? 'var(--emerald)' : 'var(--gold)';
+  document.getElementById('qb-retry').classList.toggle('hidden', !f.length);
+}
+
 function updateUI(s){
   const q=s.queue||[],a=s.active||[],c=s.completed||[],f=s.failed||[];
   const batchTotal = s.batch_total || 0;
@@ -171,6 +214,8 @@ function updateUI(s){
       statusSub.style.fontWeight = '600';
       if(statusCover) statusCover.style.display = 'none';
   }
+
+  updateQueueBar(s, q, a, f, batchDone, batchTotal, batchPct);
 
   const total=q.length+a.length;
   const badge=document.getElementById('queue-badge');
@@ -791,18 +836,19 @@ document.getElementById('mode-separate-btn').addEventListener('click', () => {
 document.getElementById('close-import-modal-btn').addEventListener('click', () => {
     closeModal('import-mode-modal');
 });
-document.getElementById('clear-queue-btn').addEventListener('click',async()=>{
+// Queue actions are shared by the Download Queue card and the global queue bar
+async function queueClear(){
   await fetch('/api/download/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({all:true})});
   toast('Queue cleared','info');
-});
-document.getElementById('stop-queue-btn').addEventListener('click',async()=>{
+}
+async function queueStop(){
   await fetch('/api/download/stop',{method:'POST',headers:{'Content-Type':'application/json'}});
   toast('Queue and active downloads stopped','info');
-});
-document.getElementById('pause-queue-btn').addEventListener('click',async()=>{
+}
+async function queueTogglePause(){
   await fetch('/api/download/pause',{method:'POST',headers:{'Content-Type':'application/json'}});
-});
-document.getElementById('retry-failed-btn').addEventListener('click',async()=>{
+}
+async function queueRetryFailed(){
     // We can either add a new endpoint for 'retry-all' or just call retry for each
     const failedItems = wsStatus.failed || [];
     if(!failedItems.length) { toast('No failed tracks to retry', 'info'); return; }
@@ -814,7 +860,15 @@ document.getElementById('retry-failed-btn').addEventListener('click',async()=>{
         });
     }
     toast(`Retrying ${failedItems.length} tracks`, 'info');
-});
+}
+document.getElementById('clear-queue-btn').addEventListener('click',queueClear);
+document.getElementById('stop-queue-btn').addEventListener('click',queueStop);
+document.getElementById('pause-queue-btn').addEventListener('click',queueTogglePause);
+document.getElementById('retry-failed-btn').addEventListener('click',queueRetryFailed);
+document.getElementById('qb-clear').addEventListener('click',queueClear);
+document.getElementById('qb-stop').addEventListener('click',queueStop);
+document.getElementById('qb-pause').addEventListener('click',queueTogglePause);
+document.getElementById('qb-retry').addEventListener('click',queueRetryFailed);
 
 // ── Files ────────────────────────────────
 async function loadFiles(path=currentPath){

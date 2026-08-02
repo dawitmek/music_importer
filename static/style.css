@@ -611,6 +611,13 @@ body {
   box-shadow: 0 20px 60px rgba(0,0,0,0.5) !important;
   border-radius: 24px !important;
   text-align: center;
+  /* .card clips with overflow:hidden — the history and suggestion dropdowns
+     are absolutely positioned and hang past the card's bottom edge */
+  overflow: visible !important;
+}
+/* The glow relied on the card's clipping to follow its rounded corner */
+.hero-search .card-glow {
+  border-radius: inherit;
 }
 .main-search {
   font-size: 18px !important;
@@ -2131,3 +2138,114 @@ select.config-input option {
 }
 
 .hidden { display: none !important; }
+
+/* ── Global Queue Bar ── */
+.queue-bar {
+  position: sticky;
+  top: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  gap: 20px;
+  padding: 12px 30px;
+  background: rgba(10, 15, 25, 0.92);
+  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(20px) saturate(180%);
+  border-bottom: 1px solid var(--border2);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+}
+.queue-bar-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+.queue-bar-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex-shrink: 0;
+}
+.queue-bar.running .queue-bar-dot {
+  background: var(--gold);
+  box-shadow: 0 0 12px var(--gold);
+  animation: throb 1.4s infinite;
+}
+.queue-bar.paused .queue-bar-dot {
+  background: var(--cyan);
+  box-shadow: 0 0 12px var(--cyan);
+}
+.queue-bar-text {
+  min-width: 0;
+}
+.queue-bar-title {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.queue-bar-detail {
+  font-size: 13px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue-bar-progress {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 200px;
+  flex-shrink: 0;
+}
+.queue-bar-bar {
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg4);
+  overflow: hidden;
+}
+.queue-bar-fill {
+  height: 100%;
+  width: 0;
+  border-radius: 2px;
+  background: linear-gradient(90deg, var(--cyan), var(--gold));
+  transition: width 0.3s ease;
+}
+.queue-bar-count {
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+.queue-bar-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+@media (max-width: 1100px) {
+  .queue-bar-progress {
+    display: none;
+  }
+}
+@media (max-width: 768px) {
+  .queue-bar {
+    flex-wrap: wrap;
+    gap: 10px;
+    padding: 10px 16px;
+  }
+  .queue-bar-actions {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .queue-bar-actions .btn {
+    flex: 1;
+    justify-content: center;
+    padding: 8px 6px;
+  }
+}
